@@ -1,0 +1,23 @@
+# 构建产物
+target/
+*.exe
+*.pdb
+
+# 运行时数据(含加密凭据与日志,绝不入库)
+campus-auth.dat
+*.dat
+*.log
+
+# 本地私有配置
+campus_auth.json
+.python-version
+
+# IDE / 系统
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Rust
+**/*.rs.bk
