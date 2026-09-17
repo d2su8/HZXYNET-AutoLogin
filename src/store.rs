@@ -28,6 +28,11 @@ pub struct StoreData {
     pub ua: String,
     #[serde(default)]
     pub adapter: String,
+    /// 门户地址(留空 = 靠 302 劫持自动发现)。
+    /// 可填基地址(http://10.10.0.1)或从浏览器地址栏抄来的完整登录页地址;
+    /// 自动发现成功时也会把门户基地址写回这里, 下次可直接用。
+    #[serde(default)]
+    pub portal_url: String,
     /// 滚动日志(与配置同文件,最多 MAX_LOG_LINES 行)
     #[serde(default)]
     pub log_lines: Vec<String>,
@@ -45,6 +50,7 @@ impl Default for StoreData {
             save_password: false,
             ua: default_ua(),
             adapter: String::new(),
+            portal_url: String::new(),
             log_lines: Vec::new(),
         }
     }

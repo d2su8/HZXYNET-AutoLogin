@@ -186,6 +186,89 @@ fn split_attrs<'a>(tag_raw: &'a str, tag_lower: &'a str) -> Vec<(&'a str, &'a st
     out
 }
 
+/// 按文档顺序解析登录页 <input>, 返回 (name, type, value)。
+/// type 取不到按 "text" 处理, value 取不到为空串。
+/// 用途: 账号/密码字段名各家门户不同(老板牌 userId/passwd, 别家 account/pwd...),
+/// 需要按 type=password 与可见文本输入的先后顺序推断, 而不是写死字段名。
+pub fn parse_form_inputs(html: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut i = 0usize;
+    while let Some(pos) = lower[i..].find("<input") {
+        let tag_start = i + pos;
+        let tag_end = match lower[tag_start..].find('>') {
+            Some(p) => tag_start + p,
+            None => break,
+        };
+        let tag_raw = &html[tag_start..tag_end.min(html.len())];
+        let tag_low = &lower[tag_start..tag_end.min(lower.len())];
+        i = tag_end + 1;
+        let attrs = split_attrs(tag_raw, tag_low);
+        if attrs.iter().any(|(k, _)| *k == "disabled") {
+            continue;
+        }
+        let mut name = None;
+        let mut value = String::new();
+        let mut typ = "text".to_string();
+        for (k, v) in &attrs {
+            match *k {
+                "name" => name = Some(v.to_string()),
+                "value" => {
+                    value = v
+                        .replace("&amp;", "&")
+                        .replace("&quot;", "\"")
+                        .replace("&#39;", "'")
+                }
+                "type" => typ = v.to_ascii_lowercase(),
+                _ => {}
+            }
+        }
+        if let Some(n) = name {
+            if !n.is_empty() {
+                out.push((n, typ, value));
+            }
+        }
+    }
+    out
+}
+
+/// 从表单输入推断 (账号字段名, 密码字段名):
+/// - 密码: 第一个 type=password 的输入
+/// - 账号: 密码框之前最近的一个可见文本输入; 找不到再按名称特征(user/account/login/name/id)找
+pub fn detect_credential_fields(
+    inputs: &[(String, String, String)],
+) -> (Option<String>, Option<String>) {
+    let visible_text = |t: &str| {
+        !matches!(
+            t,
+            "hidden" | "submit" | "button" | "reset" | "image" | "checkbox" | "radio" | "file"
+        )
+    };
+    let pass_idx = inputs.iter().position(|(_, t, _)| t == "password");
+    let pass = pass_idx.map(|i| inputs[i].0.clone());
+    let user = match pass_idx {
+        Some(pi) => inputs[..pi]
+            .iter()
+            .rev()
+            .find(|(_, t, _)| visible_text(t))
+            .map(|(n, _, _)| n.clone()),
+        None => None,
+    };
+    let user = user.or_else(|| {
+        inputs
+            .iter()
+            .filter(|(_, t, _)| visible_text(t))
+            .find(|(n, _, _)| {
+                let n = n.to_ascii_lowercase();
+                ["user", "account", "login", "name", "id"]
+                    .iter()
+                    .any(|k| n.contains(k))
+            })
+            .map(|(n, _, _)| n.clone())
+    });
+    (user, pass)
+}
+
 /// 从响应页提取隐藏域 errMessage 的 value
 pub fn extract_err_message(html: &str) -> String {
     let lower = html.to_ascii_lowercase();

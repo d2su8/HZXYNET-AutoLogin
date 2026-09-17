@@ -2,6 +2,23 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。Windows GUI/CLI 主线（main 分支）与 OpenWrt 插件（openwrt 分支）分别迭代。
 
+## [1.2.0]
+
+### 新增
+- **门户地址自动发现 + 手动填写**（为适配其他同样用 web 门户的学校）
+  - 识别不再认死门户 IP：`302` 的目标主机与请求主机不同即判为劫持（同主机跳转如 baidu→https 仍判"无结论"），
+    相对路径按当前 URL 补全；登录页请求支持跟随跳转，POST 打到最终 URL
+  - 探测不到时：先用数据文件里保存的门户地址，都没有则提示手动获取（浏览器打开任意 http 网站 → 复制跳转后的地址）
+  - 界面新增「门户地址」输入框 +「检测门户」按钮；CLI 新增 `--portal URL`、`--detect-portal`、`--save-portal`
+  - 自动发现成功时把门户基地址（`scheme://host`，不含会过期的会话参数）写回 `campus-auth.dat`
+- **账号/密码字段名按登录页推断**：老板牌是 `userId`/`passwd`，别家门户可能叫 `account`/`pwd`/`username`；
+  按 `type=password` 与其前一个可见文本输入判定，推不出来才回退固定名
+- 探测地址可用环境变量 `CAMPUS_AUTH_PROBE` 覆盖（逗号分隔 `host[:port]/path`），便于测试或自定义
+
+### 说明
+- 已用"本地假门户"端到端验证换学校场景（跨主机劫持 + 不同字段名 account/pwd + 完整登录），
+  并在真实校园网用测试账号跑通回归（字段名仍识别为 `userId`/`passwd`，认证成功）
+
 ## [1.1.0] - 2026-09-17
 
 ### 新增

@@ -16,13 +16,17 @@ pub fn print_help() {
   campus-auth-cli.exe --offline                        下线本设备并清 MAC 绑定(弹验证码图输入)\n\
   campus-auth-cli.exe --list-online                    查看本账号在线设备(需验证码)\n\
   --offline-code N --offline-session S                 (脚本)两段式提交验证码\n\
+  campus-auth-cli.exe --detect-portal                  仅探测门户地址(排查用)\n\
 选项:\n\
   --ua pc|mobile       设备类型(占 PC 槽还是手机槽), 默认 pc\n\
   --adapter NAME       网卡名(如 WLAN), 自动绑定其源 IP\n\
   --source IP          直接指定源 IP\n\
+  --portal URL         手动指定门户地址(留空=靠 302 劫持自动发现)\n\
+                       自动发现失败时: 浏览器打开任意 http 网站, 把跳转后的地址整条抄过来\n\
   --save               登录成功后保存账号(密码 DPAPI 加密)\n\
+  --save-portal        把本次发现的门户地址写进数据文件\n\
   --forget             清除已保存的账号密码\n\
-退出码: 0=成功/已在线  1=失败  3=槽位冲突需手动下线"
+退出码: 0=成功/已在线  1=失败  2=未探测到门户(需手动填门户地址)  3=槽位冲突需手动下线"
     );
 }
 
@@ -41,6 +45,9 @@ pub fn cli_main(args: &[String]) -> i32 {
     let mut offline_code: Option<String> = None;
     let mut offline_session: Option<String> = None;
     let mut list_online = false;
+    let mut portal_url = String::new();
+    let mut detect_portal = false;
+    let mut save_portal = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -97,6 +104,12 @@ pub fn cli_main(args: &[String]) -> i32 {
                 i += 1;
                 password = args.get(i).cloned().unwrap_or_default();
             }
+            "--portal" => {
+                i += 1;
+                portal_url = args.get(i).cloned().unwrap_or_default();
+            }
+            "--detect-portal" => detect_portal = true,
+            "--save-portal" => save_portal = true,
             other => {
                 eprintln!("未知参数: {other}");
                 print_help();
@@ -163,7 +176,46 @@ pub fn cli_main(args: &[String]) -> i32 {
         }
     };
 
-    let a = auth::Auth::new(&ua, source, &logger);
+    let mut a = auth::Auth::new(&ua, source, &logger);
+
+    // 门户地址: --portal > 数据文件里保存的 > 自动发现
+    if portal_url.trim().is_empty() {
+        if let Ok(s) = store.lock() {
+            portal_url = s.data.portal_url.clone();
+        }
+    }
+    a.set_portal_url(if portal_url.trim().is_empty() {
+        None
+    } else {
+        Some(portal_url.clone())
+    });
+    if !portal_url.trim().is_empty() {
+        println!("使用门户地址: {portal_url}");
+    }
+
+    // 只探测门户地址(排查/提前获取用)
+    if detect_portal {
+        return match a.detect_portal() {
+            Some(base) => {
+                println!("发现门户: {base}");
+                println!("(登录页 GET 正常, 可把它填进「门户地址」或加 --save-portal 保存)");
+                if save_portal {
+                    if let Ok(mut st) = store.lock() {
+                        st.data.portal_url = base.clone();
+                        st.save();
+                        println!("已保存到数据文件: {base}");
+                    }
+                }
+                0
+            }
+            None => {
+                println!("未发现门户(没有劫持响应, 也可能本机已在线)");
+                println!("手动获取: 浏览器打开 http://www.msftconnecttest.com/connecttest.txt,");
+                println!("把地址栏跳转后的地址整条抄下来, 用 --portal '地址' 或填进界面「门户地址」框。");
+                2
+            }
+        };
+    }
 
     if check {
         let (conclusive, _) = a.connectivity_test();
@@ -257,6 +309,14 @@ pub fn cli_main(args: &[String]) -> i32 {
         auth::CODE_OK => {
             println!("结论: 认证成功");
             0
+        }
+        auth::CODE_NO_PORTAL => {
+            println!("结论: 未探测到门户——本机可能不在校园网, 或该校 AC 不用 302 劫持");
+            println!("手动获取门户地址: 浏览器打开 http://www.msftconnecttest.com/connecttest.txt ,");
+            println!("地址栏会跳到校园网认证页, 把整条地址复制下来, 然后:");
+            println!("  campus-auth-cli.exe --portal '粘贴的地址' --username 账号 --ask-password");
+            println!("(用 --save-portal 可写入数据文件, 以后自动使用)");
+            2
         }
         auth::CODE_CONFLICT => {
             println!(

@@ -51,6 +51,11 @@ const IDC_BTN_SELF: u32 = 114;
 const IDC_LBL_STATUS: u32 = 115;
 const IDC_ED_LOG: u32 = 116;
 const IDC_BTN_OFFLINE: u32 = 117;
+const IDC_ED_PORTAL: u32 = 118;
+const IDC_BTN_DETECT: u32 = 119;
+const IDC_BTN_SLOTHELP: u32 = 120;
+/// 给 Edit 设置灰色占位提示(windows-sys 未导出该常量)
+const EM_SETCUEBANNER: u32 = 0x1501;
 
 // 下线验证码对话框控件 ID
 const IDC_CAP_IMG: u32 = 910;
@@ -71,7 +76,6 @@ const BS_AUTOCHECKBOX: u32 = 0x0000_0002;
 const BS_GROUPBOX: u32 = 0x0000_0007;
 const BS_AUTORADIOBUTTON: u32 = 0x0000_0009;
 const SS_LEFT: u32 = 0x0000_0000;
-const SS_RIGHT: u32 = 0x0000_0002;
 const ES_LEFT: u32 = 0x0000_0000;
 const ES_AUTOHSCROLL: u32 = 0x0000_0080;
 const ES_AUTOVSCROLL: u32 = 0x0000_0040;
@@ -107,6 +111,8 @@ enum UiMsg {
     OfflineCaptcha { ctx: CaptchaCtx },
     /// 下线流程②: 结束(成功或失败)
     OfflineDone { ok: bool, detail: String },
+    /// 门户探测结束(Some=门户基地址)
+    PortalFound { found: Option<String> },
 }
 
 struct App {
@@ -333,7 +339,8 @@ unsafe fn build_controls(hwnd: HWND) {
         hwnd,
         font,
     );
-    create_ctrl("BUTTON", "一键认证登录", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 572, 197, 112, 28, IDC_BTN_LOGIN, hwnd, font);
+    // 登录按钮上移, 与账号/密码两行等高(右列一个整块, 给下面的门户地址行让出空间)
+    create_ctrl("BUTTON", "一键认证登录", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 572, 162, 112, 64, IDC_BTN_LOGIN, hwnd, font);
 
     create_ctrl(
         "BUTTON",
@@ -349,6 +356,28 @@ unsafe fn build_controls(hwnd: HWND) {
         font,
     );
     create_ctrl("BUTTON", "显示", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 312, 236, 60, 20, IDC_CHK_SHOW, hwnd, font);
+    // 门户地址: 留空 = 靠 302 劫持自动发现; 检测不到时可点右侧按钮看手动获取步骤
+    create_ctrl("STATIC", "门户地址:", SS_LEFT, 0, 32, 264, 66, 18, 0, hwnd, font);
+    let ed_portal = create_ctrl(
+        "EDIT",
+        "",
+        ES_LEFT | ES_AUTOHSCROLL | WS_TABSTOP,
+        WS_EX_CLIENTEDGE,
+        104,
+        260,
+        440,
+        26,
+        IDC_ED_PORTAL,
+        hwnd,
+        font,
+    );
+    // 占位提示(灰字), 不占实际内容
+    {
+        let cue = utf16("留空=自动检测（检测不到时点右侧「检测门户」看手动获取步骤）");
+        SendMessageW(ed_portal, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+    }
+    create_ctrl("BUTTON", "检测门户", BS_PUSHBUTTON | WS_TABSTOP, 0, 552, 259, 132, 28, IDC_BTN_DETECT, hwnd, font);
+
     create_ctrl("STATIC", "设备类型:", SS_LEFT, 0, 388, 236, 66, 18, 0, hwnd, font);
     create_ctrl(
         "BUTTON",
@@ -384,19 +413,8 @@ unsafe fn build_controls(hwnd: HWND) {
         BST_CHECKED as usize,
         0,
     );
-    create_ctrl(
-        "STATIC",
-        "提示：请选择要占用的设备槽位，每个账号限制1台电脑+1部手机/平板同时在线",
-        SS_RIGHT,
-        0,
-        236,
-        262,
-        448,
-        18,
-        0,
-        hwnd,
-        font,
-    );
+    // 设备槽位说明改为「提示」按钮弹窗(原来这行静态文字会被下面的门户地址行压住)
+    create_ctrl("BUTTON", "提示", BS_PUSHBUTTON | WS_TABSTOP, 0, 624, 232, 68, 22, IDC_BTN_SLOTHELP, hwnd, font);
 
     // ===== 操作按钮行(5 键等宽) =====
     create_ctrl("BUTTON", "联通测试", BS_PUSHBUTTON | WS_TABSTOP, 0, 24, 306, 126, 30, IDC_BTN_TEST, hwnd, font);
@@ -468,6 +486,8 @@ unsafe fn handle_command(hwnd: HWND, id: u32, code: u32) {
         }
         (IDC_BTN_TEST, _) => on_connectivity_test(),
         (IDC_BTN_OFFLINE, _) => on_offline(),
+        (IDC_BTN_DETECT, _) => on_detect_portal(),
+        (IDC_BTN_SLOTHELP, _) => on_slot_help(),
         (IDC_BTN_LOGIN, _) => on_login(),
         (IDC_BTN_HISTORY, _) => open_history_window(),
         (IDC_BTN_CLEAR, _) => on_clear_saved(),
@@ -498,6 +518,8 @@ struct TaskParams {
     source: Option<std::net::Ipv4Addr>,
     adapter_name: String,
     save: bool,
+    /// 「门户地址」输入框内容(留空 = 靠 302 劫持自动发现)
+    portal: String,
 }
 
 fn current_ua_kind() -> String {
@@ -629,6 +651,9 @@ unsafe fn collect_params() -> Option<TaskParams> {
         0,
         0,
     ) == BST_CHECKED as isize;
+    let portal = get_text(GetDlgItem(app.hwnd(), IDC_ED_PORTAL as i32))
+        .trim()
+        .to_string();
     Some(TaskParams {
         user,
         pass,
@@ -636,6 +661,7 @@ unsafe fn collect_params() -> Option<TaskParams> {
         source,
         adapter_name: adapter.name,
         save,
+        portal,
     })
 }
 
@@ -746,9 +772,15 @@ unsafe fn on_login() {
         let log_fn = move |s: &str| {
             let _ = tx_log.lock().unwrap().send(UiMsg::Log(s.to_string()));
         };
-        let a = auth::Auth::new(&params.ua_kind, params.source, &log_fn);
+        let mut a = auth::Auth::new(&params.ua_kind, params.source, &log_fn);
+        a.set_portal_url(Some(params.portal.clone()));
         let (ok, code, detail) = a.login(&params.user, &params.pass);
-        // 保存/清除凭据(勾选保存 -> DPAPI 加密落盘; 未勾选 -> 清除)
+        // 自动发现的成果写回数据文件(只存 scheme://host, 不含会过期的会话参数)
+        let discovered = a
+            .discovered_base
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
         if let Some(app) = APP.get() {
             if let Ok(mut store) = app.store.lock() {
                 let pw = if params.save { Some(params.pass.as_str()) } else { None };
@@ -759,9 +791,61 @@ unsafe fn on_login() {
                     &params.ua_kind,
                     &params.adapter_name,
                 );
+                if let Some(base) = discovered {
+                    if params.portal.trim().is_empty() {
+                        let _ = tx.send(UiMsg::Log(format!("已记住门户地址: {base}")));
+                        store.data.portal_url = base;
+                        store.save();
+                    }
+                }
             }
         }
         let _ = tx.send(UiMsg::LoginDone { ok, code, detail });
+    });
+}
+
+/// 设备槽位说明(原来放在界面上的静态提示, 位置被门户地址行占用后改为弹窗)
+unsafe fn on_slot_help() {
+    let Some(app) = APP.get() else { return };
+    let text = utf16(
+        "请选择要占用的设备槽位, 每个校园网账号同时只能占 1 个电脑槽 + 1 个手机槽:\n\
+         \x20   · 选「电脑端」→ 认证后占用电脑槽\n\
+         \x20   · 选「手机端」→ 认证后占用手机槽\n\n\
+         槽位由门户按认证时的 User-Agent 判定, 并且建立 MAC 绑定后有粘性:\n\
+         想换设备类型时, 建议先点「下线本设备」(会同时清除 MAC 绑定),\n\
+         否则重新认证可能仍被识别为原来的槽位。\n\n\
+         同类型重复登录会被判为「槽位冲突」—— 本程序不会自动顶号,\n\
+         只会提示你到自助管理界面手动下线占用设备。",
+    );
+    let cap = utf16("设备槽位说明");
+    MessageBoxW(app.hwnd(), text.as_ptr(), cap.as_ptr(), MB_ICONINFORMATION);
+}
+
+/// 检测门户: 只做"找认证服务器"(探测劫持/验证已填地址), 不登录、不占用槽位
+unsafe fn on_detect_portal() {
+    let Some(app) = APP.get() else { return };
+    if app.busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(params) = collect_params() else {
+        app.busy.store(false, Ordering::SeqCst);
+        let msg = utf16("请先选择一块有 IPv4 地址的网卡.");
+        let cap = utf16("提示");
+        MessageBoxW(app.hwnd(), msg.as_ptr(), cap.as_ptr(), MB_ICONWARNING);
+        return;
+    };
+    set_busy(true, "检测门户中...");
+    log_line("---- 检测门户(只探测, 不登录) ----");
+    let tx = app.tx.lock().unwrap().clone();
+    thread::spawn(move || {
+        let tx_log = Mutex::new(tx.clone());
+        let log_fn = move |s: &str| {
+            let _ = tx_log.lock().unwrap().send(UiMsg::Log(s.to_string()));
+        };
+        let mut a = auth::Auth::new(&params.ua_kind, params.source, &log_fn);
+        a.set_portal_url(Some(params.portal.clone()));
+        let found = a.detect_portal();
+        let _ = tx.send(UiMsg::PortalFound { found });
     });
 }
 
@@ -1254,6 +1338,19 @@ unsafe fn drain_messages() {
                         let cap = utf16("槽位冲突");
                         MessageBoxW(app.hwnd(), text.as_ptr(), cap.as_ptr(), MB_ICONWARNING);
                     }
+                    (false, auth::CODE_NO_PORTAL) => {
+                        set_busy(false, "未找到门户");
+                        let text = utf16(
+                            "没有探测到校园网认证门户(可能本机不在校园网, 或该校 AC 不用 302 劫持).\n\n\
+                             手动填写门户地址的办法:\n\
+                             1. 用浏览器打开任意一个 http 网站, 例如\n   http://www.msftconnecttest.com/connecttest.txt\n\
+                             2. 浏览器会自动跳到校园网认证页 — 把地址栏里那条地址整个复制下来\n\
+                             3. 粘贴到本窗口的「门户地址」框(可以只留 http://IP 这一段), 再点「一键认证登录」\n\n\
+                             填好后会自动记进数据文件, 下次不用再填.",
+                        );
+                        let cap = utf16("需要手动填写门户地址");
+                        MessageBoxW(app.hwnd(), text.as_ptr(), cap.as_ptr(), MB_ICONWARNING);
+                    }
                     (false, auth::CODE_BADPASS) => {
                         set_busy(false, "密码错误");
                         let msg = utf16("密码错误, 请检查后重试.");
@@ -1265,6 +1362,37 @@ unsafe fn drain_messages() {
                         let msg = utf16(&format!("认证失败: {detail}"));
                         let cap = utf16("认证失败");
                         MessageBoxW(app.hwnd(), msg.as_ptr(), cap.as_ptr(), MB_ICONERROR);
+                    }
+                }
+            }
+            UiMsg::PortalFound { found } => {
+                app.busy.store(false, Ordering::SeqCst);
+                match found {
+                    Some(base) => {
+                        set_busy(false, &format!("门户: {base}"));
+                        set_text(GetDlgItem(app.hwnd(), IDC_ED_PORTAL as i32), &base);
+                        if let Ok(mut store) = app.store.lock() {
+                            store.data.portal_url = base.clone();
+                            store.save();
+                        }
+                        log_line(&format!("门户地址已填入并保存: {base}"));
+                        let msg = utf16(&format!(
+                            "找到门户: {base}\n\n已填进「门户地址」框并记入数据文件, 下次自动使用。"
+                        ));
+                        let cap = utf16("门户检测完成");
+                        MessageBoxW(app.hwnd(), msg.as_ptr(), cap.as_ptr(), MB_ICONINFORMATION);
+                    }
+                    None => {
+                        set_busy(false, "未找到门户");
+                        let text = utf16(
+                            "没有探测到门户劫持响应(本机可能已在线, 或该校 AC 不用 302 劫持).\n\n\
+                             手动获取门户地址:\n\
+                             1. 浏览器打开任意 http 网站, 例如\n   http://www.msftconnecttest.com/connecttest.txt\n\
+                             2. 浏览器会跳到校园网认证页 — 把地址栏里的地址整条复制下来\n\
+                             3. 粘贴到「门户地址」框, 再点「检测门户」验证, 或直接「一键认证登录」",
+                        );
+                        let cap = utf16("未找到门户");
+                        MessageBoxW(app.hwnd(), text.as_ptr(), cap.as_ptr(), MB_ICONWARNING);
                     }
                 }
             }
@@ -1400,6 +1528,15 @@ unsafe fn run_gui() {
         let pw = if s.data.save_password { s.get_password() } else { None };
         (s.data.username.clone(), pw, s.data.ua.clone())
     };
+    // 恢复已保存的门户地址(留空 = 自动检测)
+    let saved_portal = {
+        let s = app.store.lock().unwrap();
+        s.data.portal_url.clone()
+    };
+    if !saved_portal.is_empty() {
+        set_text(GetDlgItem(hwnd, IDC_ED_PORTAL as i32), &saved_portal);
+    }
+
     let log_ctl = GetDlgItem(hwnd, IDC_ED_LOG as i32);
     if !saved_user.is_empty() {
         set_text(GetDlgItem(hwnd, IDC_ED_USER as i32), &saved_user);

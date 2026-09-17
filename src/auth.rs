@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use crate::common::{
     decode_body, extract_err_message, parse_form_fields, urlencode, BADPASS_KEYWORDS,
-    BASE_FORM_DEFAULTS, CONFLICT_KEYWORDS, PORTAL_HOST, PROBE_URLS, UA_PC,
+    detect_credential_fields, parse_form_inputs, BASE_FORM_DEFAULTS, CONFLICT_KEYWORDS, PROBE_URLS,
+    UA_PC,
 };
 use crate::net::{HttpClient, HttpResponse};
 
@@ -32,6 +33,8 @@ pub const CODE_OK: &str = "ok";
 pub const CODE_BADPASS: &str = "badpass";
 pub const CODE_CONFLICT: &str = "conflict";
 pub const CODE_UNREACHABLE: &str = "unreachable";
+/// 探测不到门户且未配置门户地址(需用户手动填写)
+pub const CODE_NO_PORTAL: &str = "no-portal";
 pub const CODE_FAIL: &str = "fail";
 
 pub struct Auth<'a> {
@@ -41,26 +44,115 @@ pub struct Auth<'a> {
     pub is_mobile: bool,
     pub client: HttpClient,
     pub log: &'a (dyn Fn(&str) + Sync),
+    /// 手动指定的门户地址(留空/None = 只用劫持自动发现);
+    /// 可填基地址(http://10.10.0.1)或从浏览器抄来的完整登录页地址
+    pub portal_url: Option<String>,
+    /// 本次认证实际用到的门户基地址(供上层写回配置)
+    pub discovered_base: std::sync::Mutex<Option<String>>,
 }
 
-fn is_portal_location(loc: &str) -> bool {
-    if loc.starts_with('/') {
-        return true; // 相对路径 = 门户自身
+/// 取 URL 里的主机名(不含 scheme/端口/路径)
+pub fn url_host(url: &str) -> &str {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let hostport = &rest[..end];
+    // 去掉端口
+    match hostport.find(':') {
+        Some(i) => &hostport[..i],
+        None => hostport,
     }
-    // 解析 host
-    if let Some(rest) = loc.strip_prefix("http://") {
+}
+
+/// 取 URL 的"基地址" scheme://host[:port], 用于写回配置(不含会话参数)
+pub fn url_base(url: &str) -> String {
+    let scheme = if url.starts_with("https://") { "https" } else { "http" };
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    format!("{scheme}://{}", &rest[..end])
+}
+
+/// 判断某个 302 Location 是否属于"被门户劫持", 并归一化成可直接请求的绝对地址。
+///
+/// 判定规则(不依赖任何具体学校):
+/// - 相对路径 `/xxx` → 劫持(AC 常见写法), 按请求所用的主机补全
+/// - 绝对地址:
+///   - 主机与"我们请求的主机"相同 → **不是**劫持(正常跳转, 如 http→https、加/去 www)
+///   - 主机不同 → 是劫持(对 msftconnecttest/miui/baidu 这类探测地址, 正常服务器不会跳到别的域)
+///
+/// 返回 Some(绝对地址) = 被劫持; None = 正常跳转
+pub fn captive_target(requested_host: &str, loc: &str) -> Option<String> {
+    let loc = loc.trim();
+    if loc.is_empty() {
+        return None;
+    }
+    if loc.starts_with('/') {
+        // 相对路径: 按请求主机补全(AC 会再次劫持/或直接给出门户页)
+        return Some(format!("http://{requested_host}{loc}"));
+    }
+    if let Some(rest) = loc.strip_prefix("https://") {
+        // 门户极少用 https; 若真给了, 说明是被指向了某个站点, 交给上层去请求(会走 https 分支失败)
         let host = rest.split(['/', ':']).next().unwrap_or("");
-        return host.eq_ignore_ascii_case(PORTAL_HOST);
+        return if host.eq_ignore_ascii_case(requested_host) {
+            None
+        } else {
+            Some(loc.to_string())
+        };
     }
-    false
+    let host = url_host(loc);
+    if host.is_empty() || host.eq_ignore_ascii_case(requested_host) {
+        return None;
+    }
+    Some(loc.to_string())
 }
 
-fn absolute_location(loc: &str) -> String {
-    if loc.starts_with('/') {
-        format!("http://{PORTAL_HOST}{loc}")
-    } else {
-        loc.to_string()
+/// 本次要探测的地址表: 默认用内置 3 个;
+/// 环境变量 CAMPUS_AUTH_PROBE 可覆盖(逗号分隔, 形如 "127.0.0.1:8123/portal" 或 "host/path"),
+/// 供测试(指向本地假门户)或换用自己的探测地址。
+pub fn probe_targets() -> Vec<(String, String)> {
+    if let Ok(v) = std::env::var("CAMPUS_AUTH_PROBE") {
+        let list: Vec<(String, String)> = v
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                match s.find('/') {
+                    Some(i) => Some((s[..i].to_string(), s[i..].to_string())),
+                    None => Some((s.to_string(), "/".to_string())),
+                }
+            })
+            .collect();
+        if !list.is_empty() {
+            return list;
+        }
     }
+    PROBE_URLS
+        .iter()
+        .map(|(h, p)| (h.to_string(), p.to_string()))
+        .collect()
+}
+
+/// 该地址是否像门户登录页(含 password 输入框或门户特征词)
+pub fn looks_like_portal_page(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    if lower.contains("type=\"password\"") || lower.contains("type='password'") {
+        return true;
+    }
+    // 没有 password 框时退一步看特征词(门户首页/跳转页)
+    ["wlanuserip", "portal", "login.do", "self/index", "bossweb", "石斧"]
+        .iter()
+        .any(|k| lower.contains(k))
 }
 
 /// 真实手机型号池(知名旗舰/主流机型)
@@ -110,7 +202,14 @@ impl<'a> Auth<'a> {
             is_mobile,
             client: HttpClient::new(source),
             log,
+            portal_url: None,
+            discovered_base: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 设置手动门户地址(空串/None = 只用劫持自动发现)
+    pub fn set_portal_url(&mut self, url: Option<String>) {
+        self.portal_url = url.filter(|s| !s.trim().is_empty());
     }
 
     pub fn device_label(&self) -> &'static str {
@@ -127,10 +226,11 @@ impl<'a> Auth<'a> {
         {
             Ok(resp) => {
                 if let Some(loc) = resp.header("Location") {
-                    if is_portal_location(loc) {
-                        return ProbeState::Captive(absolute_location(loc));
-                    }
-                    return ProbeState::Inconclusive; // 302 到别处(如 baidu->https)
+                    // 跨主机/相对路径 => 被劫持; 同主机跳转(如 baidu->https) => 无结论
+                    return match captive_target(host, loc) {
+                        Some(url) => ProbeState::Captive(url),
+                        None => ProbeState::Inconclusive,
+                    };
                 }
                 if resp.status == 200 || resp.status == 204 {
                     return ProbeState::Online;
@@ -141,17 +241,70 @@ impl<'a> Auth<'a> {
         }
     }
 
+    /// 跟随跳转抓取登录页, 返回 (最终 URL, HTML, Cookie)。最多 3 跳。
+    /// 相对 Location 按当前 URL 补全, 因此不再依赖任何写死的门户地址。
+    fn fetch_login_page(&self, start_url: &str) -> Result<(String, String, String), String> {
+        let mut url = start_url.to_string();
+        for hop in 0..3 {
+            let resp = self.client.request(
+                "GET",
+                &url,
+                &[
+                    ("User-Agent", self.ua.as_str()),
+                    ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                    ("Accept-Language", "zh-CN,zh;q=0.9"),
+                ],
+                None,
+            )?;
+            if let Some(loc) = resp.header("Location") {
+                let next = if loc.trim().starts_with('/') {
+                    format!("{}{}", url_base(&url), loc.trim())
+                } else if loc.trim().starts_with("http://") || loc.trim().starts_with("https://") {
+                    loc.trim().to_string()
+                } else {
+                    // 形如 "portal/login?...": 相对当前目录
+                    let base = url.trim_end_matches('/');
+                    format!("{base}/{}", loc.trim())
+                };
+                (self.log)(&format!(
+                    "  跳转 {} -> {}",
+                    url,
+                    next
+                ));
+                url = next;
+                if hop == 2 {
+                    return Err("跳转次数过多, 未拿到登录页".into());
+                }
+                continue;
+            }
+            if resp.status != 200 {
+                return Err(format!("登录页 HTTP {}", resp.status));
+            }
+            let html = decode_body(&resp.body);
+            let cookie = resp
+                .header("Set-Cookie")
+                .and_then(|c| c.split(';').next())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return Ok((url, html, cookie));
+        }
+        Err("未拿到登录页".into())
+    }
+
     /// 并发探测三个地址, 任一给出结论即返回
     /// 返回 (Some(true)=在线 / Some(false)=被劫持 / None=无结论, 详情)
     pub fn connectivity_test(&self) -> (Option<bool>, String) {
-        (self.log)("联通测试开始(并发 3 个探测地址)...");
+        let targets = probe_targets();
+        (self.log)(&format!("联通测试开始(并发 {} 个探测地址)...", targets.len()));
         let (tx, rx) = std::sync::mpsc::channel();
         thread::scope(|s| {
-            for (host, path) in PROBE_URLS {
+            for (host, path) in &targets {
                 let tx = tx.clone();
+                let (h, p) = (host.clone(), path.clone());
                 s.spawn(move || {
-                    let state = self.probe_one(host, path);
-                    let _ = tx.send((host, path, state));
+                    let state = self.probe_one(&h, &p);
+                    let _ = tx.send((h, p, state));
                 });
             }
             drop(tx);
@@ -182,6 +335,39 @@ impl<'a> Auth<'a> {
         })
     }
 
+    /// 只做"找认证服务器": 探测劫持(或验证已配置的门户地址), 返回门户基地址。
+    /// 用于 `--detect-portal` 与界面「检测门户」, 不登录、不改任何状态。
+    pub fn detect_portal(&self) -> Option<String> {
+        for (host, path) in probe_targets() {
+            if let ProbeState::Captive(url) = self.probe_one(&host, &path) {
+                (self.log)(&format!("探测 {host}{path} -> 302 被劫持: {url}"));
+                let base = url_base(&url);
+                match self.fetch_login_page(&url) {
+                    Ok((final_url, html, _)) => {
+                        (self.log)(&format!(
+                            "  登录页{} (最终地址 {final_url})",
+                            if looks_like_portal_page(&html) { "正常" } else { "内容不像门户登录页" }
+                        ));
+                    }
+                    Err(e) => (self.log)(&format!("  登录页抓取失败: {e}")),
+                }
+                return Some(base);
+            }
+        }
+        // 没有劫持响应: 验证配置里的地址
+        if let Some(p) = self.portal_url.as_deref() {
+            (self.log)(&format!("无劫持响应, 验证配置的门户地址: {p}"));
+            if let Ok((final_url, html, _)) = self.fetch_login_page(p) {
+                (self.log)(&format!(
+                    "  可达, {} (最终地址 {final_url})",
+                    if looks_like_portal_page(&html) { "像门户登录页" } else { "内容不像门户登录页" }
+                ));
+                return Some(url_base(&final_url));
+            }
+        }
+        None
+    }
+
     /// 完整登录流程. 返回 (成功?, code, detail)
     pub fn login(&self, username: &str, password: &str) -> (bool, &'static str, String) {
         (self.log)(&format!(
@@ -196,69 +382,57 @@ impl<'a> Auth<'a> {
 
         // ---- 第 1 步: 探测, 拿劫持 Location ------------------------------
         let mut loc: Option<String> = None;
-        match self.probe_one(PROBE_URLS[0].0, PROBE_URLS[0].1) {
-            ProbeState::Online => {
-                (self.log)("探测: 已放行, 本机已在线, 无需认证");
-                return (true, CODE_ALREADY, "已在线".into());
-            }
-            ProbeState::Captive(l) => loc = Some(l),
-            ProbeState::Inconclusive | ProbeState::Unreachable(_) => {
-                for (host, path) in &PROBE_URLS[1..] {
-                    match self.probe_one(host, path) {
-                        ProbeState::Online => {
-                            (self.log)("探测: 已放行, 本机已在线, 无需认证");
-                            return (true, CODE_ALREADY, "已在线".into());
-                        }
-                        ProbeState::Captive(l) => {
-                            loc = Some(l);
-                            break;
-                        }
-                        _ => continue,
-                    }
+        for (host, path) in probe_targets() {
+            match self.probe_one(&host, &path) {
+                ProbeState::Online => {
+                    (self.log)(&format!("探测 {host}{path} -> 已放行, 本机已在线"));
+                    return (true, CODE_ALREADY, "已在线".into());
                 }
+                ProbeState::Captive(l) => {
+                    loc = Some(l);
+                    break;
+                }
+                _ => continue,
             }
         }
+        // 探测不到劫持: 用配置里的门户地址; 也没有则提示手动获取
         let loc = match loc {
-            Some(l) => l,
-            None => {
-                (self.log)("!! 探测不到门户劫持响应: 网卡可能未连接校园网");
-                return (
-                    false,
-                    CODE_UNREACHABLE,
-                    "探测无劫持响应,无法取得会话参数".into(),
-                );
+            Some(l) => {
+                (self.log)("第 1 步完成: 未认证, 已取得会话绑定参数");
+                (self.log)(&format!("  Location = {l}"));
+                if let Ok(mut g) = self.discovered_base.lock() {
+                    *g = Some(url_base(&l));
+                }
+                l
             }
+            None => match self.portal_url.as_deref() {
+                Some(p) => {
+                    (self.log)(&format!(
+                        "探测不到劫持响应, 改用配置的门户地址: {p}"
+                    ));
+                    p.to_string()
+                }
+                None => {
+                    (self.log)("!! 探测不到门户劫持响应, 且未配置门户地址");
+                    (self.log)("   手动获取办法: 浏览器打开任意 http 网站(如 http://www.msftconnecttest.com/connecttest.txt),");
+                    (self.log)("   地址栏会跳到校园网认证页 — 把那个地址整条复制到「门户地址」框里再试。");
+                    return (
+                        false,
+                        CODE_NO_PORTAL,
+                        "未探测到门户, 请手动填写门户地址(浏览器打开任意 http 网站, 复制跳转后的地址)".into(),
+                    );
+                }
+            },
         };
-        (self.log)("第 1 步完成: 未认证, 已取得会话绑定参数");
-        (self.log)(&format!("  Location = {loc}"));
 
-        // ---- 第 2 步: GET 登录页, 种 Cookie + 动态解析字段 ----------------
-        let resp = match self.client.request(
-            "GET",
-            &loc,
-            &[
-                ("User-Agent", self.ua.as_str()),
-                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-                ("Accept-Language", "zh-CN,zh;q=0.9"),
-            ],
-            None,
-        ) {
-            Ok(r) => r,
+        // ---- 第 2 步: GET 登录页(跟随跳转), 种 Cookie + 动态解析字段 ------
+        let (loc, page_text, cookie) = match self.fetch_login_page(&loc) {
+            Ok(v) => v,
             Err(e) => {
                 (self.log)(&format!("!! 获取登录页失败: {e}"));
                 return (false, CODE_UNREACHABLE, format!("门户连接失败: {e}"));
             }
         };
-        if resp.status != 200 {
-            (self.log)(&format!("!! 登录页返回 HTTP {}, 非预期", resp.status));
-            return (false, CODE_FAIL, format!("登录页 HTTP {}", resp.status));
-        }
-        let cookie = resp
-            .header("Set-Cookie")
-            .and_then(|c| c.split(';').next())
-            .unwrap_or("")
-            .trim()
-            .to_string();
         if cookie.is_empty() {
             (self.log)("第 2 步完成: 门户未下发 Cookie, 继续尝试");
         } else {
@@ -268,7 +442,6 @@ impl<'a> Auth<'a> {
             ));
         }
 
-        let page_text = decode_body(&resp.body);
         let fields = parse_form_fields(&page_text);
         let get_field = |name: &str| -> Option<String> {
             fields
@@ -336,12 +509,21 @@ impl<'a> Auth<'a> {
             pair.1 = tt.to_string();
         }
         (self.log)(&format!("  认证身份: 设备={} templatetype={}", self.device_label(), tt));
-        // userId/passwd 覆盖页面值(保持页面出现顺序, 同浏览器表单提交)
-        if let Some(pair) = form_pairs.iter_mut().find(|(k, _)| k == "userId") {
+        // 账号/密码字段名按登录页推断(老板牌是 userId/passwd, 别家门户可能叫 account/pwd/username...),
+    // 推不出来时才回退到老板牌的固定名 —— 这样换学校也不用改代码
+        let (uf, pf) = detect_credential_fields(&parse_form_inputs(&page_text));
+        let user_field = uf.unwrap_or_else(|| "userId".to_string());
+        let pass_field = pf.unwrap_or_else(|| "passwd".to_string());
+        (self.log)(&format!("  表单身份字段: 账号={user_field} 密码={pass_field}"));
+        if let Some(pair) = form_pairs.iter_mut().find(|(k, _)| *k == user_field) {
             pair.1 = username.to_string();
+        } else {
+            form_pairs.push((user_field.clone(), username.to_string()));
         }
-        if let Some(pair) = form_pairs.iter_mut().find(|(k, _)| k == "passwd") {
+        if let Some(pair) = form_pairs.iter_mut().find(|(k, _)| *k == pass_field) {
             pair.1 = password.to_string();
+        } else {
+            form_pairs.push((pass_field.clone(), password.to_string()));
         }
         let body = form_pairs
             .iter()
@@ -406,7 +588,12 @@ impl<'a> Auth<'a> {
                 "第 4 步: 等待 3 秒后复核放行 (第 {attempt}/2 次)..."
             ));
             thread::sleep(Duration::from_secs(3));
-            match self.probe_one(PROBE_URLS[0].0, PROBE_URLS[0].1) {
+            // 复核用与探测同一批地址(默认即内置第一个), 换过探测地址时行为一致
+            let (rh, rp) = probe_targets()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| (PROBE_URLS[0].0.to_string(), PROBE_URLS[0].1.to_string()));
+            match self.probe_one(&rh, &rp) {
                 ProbeState::Online => {
                     (self.log)("复核: 200/204 无重定向 -> 已放行");
                     (self.log)("=== 认证成功, 已上线! ===");
@@ -439,5 +626,81 @@ impl<'a> Auth<'a> {
         (self.log)("2. 在「在线设备 / 终端管理」中手动下线占用槽位的设备");
         (self.log)("3. 回到本程序重新点击认证");
         (self.log)("说明: 账号限 1 台电脑 + 1 台手机同时在线; 本程序不会自动顶号.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- 劫持识别: 跨主机/相对路径算劫持, 同主机跳转不算 ----
+
+    #[test]
+    fn same_host_redirect_is_not_captive() {
+        // baidu 的 http->https 正常跳转, 不能误判成被劫持
+        assert_eq!(captive_target("www.baidu.com", "https://www.baidu.com/"), None);
+        assert_eq!(captive_target("www.baidu.com", "http://www.baidu.com/index.html"), None);
+        assert_eq!(captive_target("WWW.Baidu.com", "https://www.baidu.com/"), None);
+    }
+
+    #[test]
+    fn other_school_portal_is_captive() {
+        // 别的学校的门户: 绝对地址指向自己的私网 IP
+        let got = captive_target("www.msftconnecttest.com", "http://10.10.0.1/portal/login?wlanuserip=1.2.3.4");
+        assert_eq!(got.as_deref(), Some("http://10.10.0.1/portal/login?wlanuserip=1.2.3.4"));
+        // 公网域名当门户(云端认证)同样算劫持
+        assert!(captive_target("www.msftconnecttest.com", "http://auth.school.edu.cn/wifi/login").is_some());
+        // 带端口的门户
+        assert!(captive_target("connect.rom.miui.com", "http://10.0.0.9:8080/portal").is_some());
+    }
+
+    #[test]
+    fn relative_location_resolved_against_requested_host() {
+        // 相对路径: 不能再用写死的门户 IP 去拼
+        let got = captive_target("www.msftconnecttest.com", "/portal/login?mac=aabbccddeeff");
+        assert_eq!(got.as_deref(), Some("http://www.msftconnecttest.com/portal/login?mac=aabbccddeeff"));
+    }
+
+    #[test]
+    fn empty_or_odd_location() {
+        assert_eq!(captive_target("h", ""), None);
+        assert_eq!(captive_target("h", "   "), None);
+    }
+
+    // ---- URL 工具 ----
+
+    #[test]
+    fn url_host_and_base() {
+        assert_eq!(url_host("http://10.10.0.1:8080/portal/login?x=1"), "10.10.0.1");
+        assert_eq!(url_host("https://www.msftconnecttest.com/connecttest.txt"), "www.msftconnecttest.com");
+        assert_eq!(url_host("10.10.0.1/portal"), "10.10.0.1");
+        assert_eq!(url_base("http://10.10.0.1:8080/portal/login?x=1"), "http://10.10.0.1:8080");
+        assert_eq!(url_base("http://10.255.2.252/portal/login?wlanuserip=1.2.3.4"), "http://10.255.2.252");
+    }
+
+    // ---- 登录页特征 ----
+
+    #[test]
+    fn portal_page_detection() {
+        assert!(looks_like_portal_page(r#"<input type="password" name="pwd">"#));
+        assert!(looks_like_portal_page("...wlanuserip=1.2.3.4..."));
+        assert!(looks_like_portal_page("<title>Portal Login</title>"));
+        assert!(!looks_like_portal_page("<!doctype html><html><body>hello</body></html>"));
+    }
+
+    // ---- 探测地址可覆盖(测试钩子) ----
+
+    #[test]
+    fn probe_targets_override() {
+        // 不设环境变量时用内置表
+        std::env::remove_var("CAMPUS_AUTH_PROBE");
+        assert_eq!(probe_targets().len(), PROBE_URLS.len());
+        // 设了就只用自定义的, 且支持 host/path 与裸 host
+        std::env::set_var("CAMPUS_AUTH_PROBE", "127.0.0.1:8123/portal, example.com");
+        let t = probe_targets();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0], ("127.0.0.1:8123".to_string(), "/portal".to_string()));
+        assert_eq!(t[1], ("example.com".to_string(), "/".to_string()));
+        std::env::remove_var("CAMPUS_AUTH_PROBE");
     }
 }
