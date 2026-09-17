@@ -7,6 +7,9 @@
 
 贺州学院校园网（bossWeb 门户）自动认证工具 —— Rust + Win32 API 编写的原生 Windows 应用，单文件可执行、零运行时依赖。
 
+> **同一套认证协议的路由器版**：[PortalKeeper](https://github.com/d2su8/PortalKeeper) —— OpenWrt 插件（Rust 静态单二进制 + LuCI 中文界面，opkg 安装），
+> 开机自动认证、掉线自动重连、多线多拨、逐线路联通测试，日志只写 /tmp 不磨损 NAND。路由器上认证一次，全屋设备共享在线。
+
 > 本项目由 **AI 辅助完成**（AI-Assisted），详见 [AI-NOTES.md](AI-NOTES.md)。
 
 ## 功能特性
@@ -98,6 +101,17 @@ Hzunet-autologin/
 ├─ AI-NOTES.md          # AI 编辑项目说明
 └─ LICENSE
 ```
+
+## 相关项目
+
+同一套「探测劫持 → 表单提交 → 复核放行」认证协议，两种运行形态：
+
+| 项目 | 形态 | 适用场景 |
+|---|---|---|
+| **本项目** | Windows 10 / 11 x64 | Rust + Win32 原生 GUI，单文件零运行时依赖；适合单机——例如网线接普通网络、Wi-Fi 接校园网的双网卡环境，按网卡绑定源 IP 发包 |
+| [PortalKeeper](https://github.com/d2su8/PortalKeeper) | OpenWrt / LuCI | 路由器插件：Rust 静态单二进制 + LuCI 中文 Web 界面，opkg 安装；procd 开机自启、掉线自动重试、多线多拨、逐线路联通测试、自定义探测网站；日志只写 /tmp（不磨损 NAND）；路由器认证一次，全屋设备共享在线 |
+
+两者的协议细节同源，协议文档见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。
 
 ## 安全说明
 
