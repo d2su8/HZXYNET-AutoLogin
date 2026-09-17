@@ -108,7 +108,7 @@ pub fn list_adapters() -> Vec<Adapter> {
                 while !ua.is_null() {
                     let u = &*ua;
                     // Address 是 SOCKET_ADDRESS(包着裸指针 SOCKADDR)
-                    let sa = unsafe { &*u.Address.lpSockaddr };
+                    let sa = &*u.Address.lpSockaddr;
                     if let Some(ip) = sockaddr_to_ipv4(sa) {
                         // 过滤 APIPA 链路本地地址
                         if !ip.is_link_local() && !ip.is_loopback() {
@@ -133,7 +133,8 @@ pub fn list_adapters() -> Vec<Adapter> {
     }
 }
 
-/// 网卡名 -> 第一个 IPv4
+/// 网卡名 -> 第一个 IPv4 (仅 CLI 使用)
+#[allow(dead_code)]
 pub fn resolve_adapter_ip(name: &str) -> Option<Ipv4Addr> {
     list_adapters()
         .into_iter()
@@ -141,7 +142,8 @@ pub fn resolve_adapter_ip(name: &str) -> Option<Ipv4Addr> {
         .and_then(|a| a.ipv4.into_iter().next())
 }
 
-/// 自动猜测校园网网卡: 10.200/10.202 段优先,其次名字含 WLAN/WiFi/无线
+/// 自动猜测校园网网卡: 10.200/10.202 段优先,其次名字含 WLAN/WiFi/无线 (仅 CLI 使用)
+#[allow(dead_code)]
 pub fn guess_campus_adapter() -> Option<Adapter> {
     let adapters = list_adapters();
     for a in &adapters {

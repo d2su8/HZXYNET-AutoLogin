@@ -6,13 +6,12 @@
 //! 3. 是否上线只看复核探测的响应头(无 Location = 已放行), 不解析中文提示
 //! 4. 撞槽位(已在线/超限)绝不自动顶号, 只提示手动下线
 
-use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
 use crate::common::{
     decode_body, extract_err_message, parse_form_fields, urlencode, BADPASS_KEYWORDS,
-    BASE_FORM_DEFAULTS, CONFLICT_KEYWORDS, PORTAL_HOST, PROBE_URLS, UA_MOBILE, UA_PC,
+    BASE_FORM_DEFAULTS, CONFLICT_KEYWORDS, PORTAL_HOST, PROBE_URLS, UA_PC,
 };
 use crate::net::{HttpClient, HttpResponse};
 
@@ -37,7 +36,7 @@ pub const CODE_FAIL: &str = "fail";
 
 pub struct Auth<'a> {
     /// 完整 User-Agent 串
-    pub ua: &'a str,
+    pub ua: String,
     /// 是否手机端(随机 UA 下不能用 ua==UA_MOBILE 判断)
     pub is_mobile: bool,
     pub client: HttpClient,
@@ -100,14 +99,10 @@ impl<'a> Auth<'a> {
         log: &'a (dyn Fn(&str) + Sync),
     ) -> Self {
         let ua = match ua_kind {
-            "mobile" => {
-                // 每次登录生成随机手机端标识(真实机型池), 降低被按 UA 指纹识别的概率
-                let ua_random: &'static str =
-                    Box::leak(random_mobile_ua().into_boxed_str());
-                ua_random
-            }
-            "pc" => UA_PC,
-            other => Box::leak(other.to_string().into_boxed_str()), // 自定义 UA
+            // 每次登录生成随机手机端标识(真实机型池), 降低被按 UA 指纹识别的概率
+            "mobile" => random_mobile_ua(),
+            "pc" => UA_PC.to_string(),
+            other => other.to_string(), // 自定义 UA
         };
         let is_mobile = ua_kind == "mobile" || (ua_kind != "pc" && ua.contains("Mobile"));
         Auth {
@@ -150,7 +145,7 @@ impl<'a> Auth<'a> {
     /// 返回 (Some(true)=在线 / Some(false)=被劫持 / None=无结论, 详情)
     pub fn connectivity_test(&self) -> (Option<bool>, String) {
         (self.log)("联通测试开始(并发 3 个探测地址)...");
-        let (tx, rx) = mpsc_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         thread::scope(|s| {
             for (host, path) in PROBE_URLS {
                 let tx = tx.clone();
@@ -242,7 +237,7 @@ impl<'a> Auth<'a> {
             "GET",
             &loc,
             &[
-                ("User-Agent", self.ua),
+                ("User-Agent", self.ua.as_str()),
                 ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
                 ("Accept-Language", "zh-CN,zh;q=0.9"),
             ],
@@ -368,7 +363,7 @@ impl<'a> Auth<'a> {
         (self.log)(&format!("  表单明细: {}", keys_dbg));
 
         let headers = [
-            ("User-Agent", self.ua),
+            ("User-Agent", self.ua.as_str()),
             ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
             ("Accept-Language", "zh-CN,zh;q=0.9"),
             ("Content-Type", "application/x-www-form-urlencoded"),
@@ -445,9 +440,4 @@ impl<'a> Auth<'a> {
         (self.log)("3. 回到本程序重新点击认证");
         (self.log)("说明: 账号限 1 台电脑 + 1 台手机同时在线; 本程序不会自动顶号.");
     }
-}
-
-// mpsc 的简短别名(避免直接依赖 std::sync::mpsc 全路径散落)
-fn mpsc_channel<T>() -> (Sender<T>, std::sync::mpsc::Receiver<T>) {
-    std::sync::mpsc::channel()
 }

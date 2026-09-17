@@ -1,4 +1,4 @@
-# Hzunet-autologin
+# HZXYNET-AutoLogin（贺州学院校园网自动认证项目）
 
 [![AI Assisted](https://img.shields.io/badge/AI-Assisted%20Project-blue)](AI-NOTES.md)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey)]()
@@ -18,6 +18,7 @@
 - **内嵌日志**：认证过程逐条显示在程序界面，并随配置合并写入单一数据文件
 - **幂等保活**：已在线时只探测不重复登录；DHCP 换 IP 后重新认证即可恢复
 - **槽位冲突保护**：检测到设备槽位被占用时绝不自动顶号，只提示到自助管理界面手动下线
+- **一键下线本设备**：走门户自助管理接口（在线设备列表 → 踢下线 → 复核断网），门户强制验证码，弹图输入 4 位即可
 
 ## 环境要求
 
@@ -54,11 +55,13 @@
 campus-auth-cli.exe --check                 # 仅探测认证状态
 campus-auth-cli.exe --list-adapters         # 列出网卡
 campus-auth-cli.exe --ask-password          # 交互登录（默认电脑端）
+campus-auth-cli.exe --offline               # 下线本设备并清 MAC 绑定（弹验证码图，输入 4 位后自动下线）
   --ua pc|mobile      设备类型
   --adapter NAME      网卡名
   --source IP         直接指定源 IP
   --save              登录成功后加密保存凭据
   --forget            清除已保存凭据
+  --offline-code N --offline-session S   # 脚本两段式提交验证码
 退出码: 0=成功/已在线  1=失败  3=槽位冲突需手动下线
 ```
 
@@ -85,6 +88,7 @@ Hzunet-autologin/
 │  ├─ cli_main.rs       # CLI 入口(console 子系统)
 │  ├─ cli_shared.rs     # CLI 逻辑(与 GUI 共享引擎)
 │  ├─ auth.rs           # 认证引擎(探测/登录/复核)
+│  ├─ selfsvc.rs        # 自助管理接口(设备列表/下线本设备/验证码解码)
 │  ├─ net.rs            # 网卡枚举 + 绑定源 IP 的 HTTP 客户端
 │  ├─ crypto.rs         # DPAPI 加密存储
 │  ├─ store.rs          # 单一数据文件(配置+加密凭据+滚动日志)

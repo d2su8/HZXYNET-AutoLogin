@@ -75,3 +75,21 @@ scheme=http&serverIp=tomcat_server%3A80&hostIp=http%3A%2F%2F127.0.0.1%3A8081%2F
 - **DHCP 换 IP**：认证按 IP+MAC 放行，租约更新换 IP 后需重新认证
 - **编码**：门户响应以 UTF-8 为主，个别流程页为 GBK，建议 UTF-8 → GBK 顺序容错解码
 - **幂等**：已在线时只探测不提交表单，探测请求应保持轻量（单请求、短超时）
+
+## 7. 自助管理下线接口（/self，实测）
+
+下线走门户自助管理 JSON API（与 web 认证同主机 `10.255.2.252` 但**独立会话**，门户登录不贯通）。全链路：
+
+1. `POST /self/tologin.do {}` → `Set-Cookie: JSESSIONID-BOSS-1=<SPA会话>`，`data.verifyCode` 为 base64 PNG 验证码（130×40，与该会话绑定）
+2. `POST /self/login.do {"accountId","password","verifyCode"}`（带同一 Cookie）→ `errcode=0`；缺 Cookie 一律「验证码为空」
+3. `POST /self/getonline.do {"accountId"}` → `rows[]`，行字段：`accountId/accountMac/billingId/accountIp/serverIp/onlineTime/port/nasId/vlanId/terminalType('a'=PC,'b'=手机)/osInfo/broswerType/externalFlag/authType/binded`
+4. `POST /self/kickonline.do {"accountId","accountIp","billingId","serverIp"}`（必须用本机行的 live 值）→「下线成功」，3–4 秒内设备回 captive；`kickonlineByMac.do {"accountId","accountMac"}` 按 MAC 批下线并**清除绑定**；`clearusermac.do {"accountId"}` 仅清绑定
+
+要点：
+
+- **调用规约**：全部 POST + `Content-Type: application/json`（表单编码→415，空/畸形 JSON→400），响应统一 `{"errcode","errmsg","success"}`，未登录业务接口 `errcode=-1「请重新登录」`
+- **单 IP 单会话**：同 IP 在线时换 UA 再登录 →「此IP已在线请勿重复认证」
+- **设备分类是 MAC 绑定粘性**：计费行分类在建绑定的那次登录按 UA 确定，之后同 MAC 换 UA 不变（门户模板仍随 UA）；换槽 = 清绑定（kick ByMac）→ 目标 UA 重登
+- **清绑定注意**：`kickonline`（按行下线）**不**清除 MAC 绑定；`clearusermac.do` 虽返回「操作成功」但实测不总能实际清掉绑定（次日登录仍沿用旧分类）。修正/切换槽位请用 `kickonlineByMac`
+- **限流**：连续登录间隔 <15s 会「认证请求太频繁」，重试间隔建议 ≥30s
+- **策略**：仅下线本机（行匹配本机 MAC/IP），绝不顶号；死路：`webdisconn.do`（恒拒绝）、`appoffline.do`（404）、在线态 `1.1.1.1/userlogout.massrv`（直通公网）

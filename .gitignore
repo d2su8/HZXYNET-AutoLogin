@@ -6,6 +6,7 @@ target/
 # 运行时数据(含加密凭据与日志,绝不入库)
 campus-auth.dat
 *.dat
+*.dat.tmp
 *.log
 
 # 本地私有配置

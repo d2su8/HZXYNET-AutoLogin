@@ -19,9 +19,6 @@ pub const PROBE_URLS: [(&str, &str); 3] = [
 /// 电脑端 User-Agent (占 PC 槽)
 pub const UA_PC: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-/// 手机端 User-Agent (占手机槽)
-pub const UA_MOBILE: &str = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 \
-(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 
 /// B 组配置字段默认值(优先从登录页动态解析,缺失时兜底)
 pub const BASE_FORM_DEFAULTS: [(&str, &str); 9] = [

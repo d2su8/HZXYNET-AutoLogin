@@ -2,6 +2,7 @@
 
 use crate::auth;
 use crate::net;
+use crate::selfsvc;
 use crate::store::Store;
 
 pub fn print_help() {
@@ -12,6 +13,9 @@ pub fn print_help() {
   campus-auth-cli.exe --list-adapters                  列出网卡\n\
   campus-auth-cli.exe --username U --password P        登录(默认电脑端)\n\
   campus-auth-cli.exe --ask-password                   交互输入密码\n\
+  campus-auth-cli.exe --offline                        下线本设备并清 MAC 绑定(弹验证码图输入)\n\
+  campus-auth-cli.exe --list-online                    查看本账号在线设备(需验证码)\n\
+  --offline-code N --offline-session S                 (脚本)两段式提交验证码\n\
 选项:\n\
   --ua pc|mobile       设备类型(占 PC 槽还是手机槽), 默认 pc\n\
   --adapter NAME       网卡名(如 WLAN), 自动绑定其源 IP\n\
@@ -33,6 +37,10 @@ pub fn cli_main(args: &[String]) -> i32 {
     let mut list = false;
     let mut save = false;
     let mut forget = false;
+    let mut offline = false;
+    let mut offline_code: Option<String> = None;
+    let mut offline_session: Option<String> = None;
+    let mut list_online = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -43,6 +51,16 @@ pub fn cli_main(args: &[String]) -> i32 {
             "--save" => save = true,
             "--forget" => forget = true,
             "--ask-password" => ask_password = true,
+            "--offline" => offline = true,
+            "--list-online" => list_online = true,
+            "--offline-code" => {
+                i += 1;
+                offline_code = args.get(i).cloned();
+            }
+            "--offline-session" => {
+                i += 1;
+                offline_session = args.get(i).cloned();
+            }
             "--help" | "-h" => {
                 print_help();
                 return 0;
@@ -191,6 +209,35 @@ pub fn cli_main(args: &[String]) -> i32 {
         return 1;
     }
 
+    if list_online {
+        return run_list_online(source, &username, &password, offline_code, offline_session, &logger);
+    }
+
+    if offline {
+        let adapter = if !adapter_name.is_empty() {
+            net::list_adapters()
+                .into_iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&adapter_name))
+        } else {
+            net::guess_campus_adapter()
+        };
+        let mac_nosep = adapter
+            .as_ref()
+            .map(|a| selfsvc::norm_mac(&a.mac))
+            .unwrap_or_default();
+        let my_ip = source.map(|s| s.to_string()).unwrap_or_default();
+        return run_offline(
+            source,
+            &username,
+            &password,
+            &mac_nosep,
+            &my_ip,
+            offline_code,
+            offline_session,
+            &logger,
+        );
+    }
+
     let (ok, code, detail) = a.login(&username, &password);
 
     if ok && save {
@@ -225,6 +272,176 @@ pub fn cli_main(args: &[String]) -> i32 {
         _ => {
             println!("结论: 认证失败 ({detail})");
             1
+        }
+    }
+}
+
+/// 下线/查询公共前置: 取验证码(交互或两段式)并登录自助系统
+fn spa_login_with_captcha(
+    spa: &mut selfsvc::Spa,
+    username: &str,
+    password: &str,
+    offline_code: Option<String>,
+    offline_session: Option<String>,
+) -> Result<(), String> {
+    let code: String = match (offline_session, offline_code) {
+        (Some(session), Some(c)) => {
+            spa.cookie = session;
+            c
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--offline-code 与 --offline-session 必须同时提供".into());
+        }
+        _ => {
+            let cap = spa.tologin()?;
+            let path = selfsvc::save_captcha_png(&cap.png)?;
+            println!("验证码图片: {}", path.display());
+            println!(
+                "自助会话: {} (脚本可配合 --offline-session 复用)",
+                cap.cookie
+            );
+            unsafe {
+                let wp: Vec<u16> = path
+                    .as_os_str()
+                    .to_string_lossy()
+                    .encode_utf16()
+                    .chain([0])
+                    .collect();
+                let op: Vec<u16> = "open".encode_utf16().chain([0]).collect();
+                windows_sys::Win32::UI::Shell::ShellExecuteW(
+                    std::ptr::null_mut(),
+                    op.as_ptr(),
+                    wp.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1, /* SW_SHOWNORMAL */
+                );
+            }
+            print!("请输入图中 4 位验证码: ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            let t = line.trim().to_string();
+            if t.chars().count() < 4 {
+                return Err("验证码不完整".into());
+            }
+            t
+        }
+    };
+    spa.login(username, password, &code)
+}
+
+/// 查看本账号在线设备(只读, 不做任何下线)
+fn run_list_online(
+    source: Option<std::net::Ipv4Addr>,
+    username: &str,
+    password: &str,
+    offline_code: Option<String>,
+    offline_session: Option<String>,
+    logger: &(dyn Fn(&str) + Sync),
+) -> i32 {
+    let mut spa = selfsvc::Spa::new(source, logger);
+    if let Err(e) = spa_login_with_captcha(&mut spa, username, password, offline_code, offline_session) {
+        eprintln!("!! {e}");
+        return 1;
+    }
+    let rows = match spa.getonline(username) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("!! {e}");
+            return 1;
+        }
+    };
+    if rows.is_empty() {
+        println!("当前没有在线会话");
+        return 0;
+    }
+    println!("账号 {} 在线设备 {} 台:", username, rows.len());
+    for r in &rows {
+        println!(
+            "  IP={}  槽位={}({})  MAC={}  上线时间={}",
+            r.account_ip,
+            if r.terminal_type == "b" { "手机" } else { "PC" },
+            r.os_info,
+            r.account_mac,
+            r.online_time
+        );
+    }
+    0
+}
+
+/// 下线本设备: tologin(验证码) → login → getonline → 匹配本机行 → kickonlineByMac(清绑定) → 复核断网
+#[allow(clippy::too_many_arguments)]
+fn run_offline(
+    source: Option<std::net::Ipv4Addr>,
+    username: &str,
+    password: &str,
+    mac_nosep: &str,
+    my_ip: &str,
+    offline_code: Option<String>,
+    offline_session: Option<String>,
+    logger: &(dyn Fn(&str) + Sync),
+) -> i32 {
+    let mut spa = selfsvc::Spa::new(source, logger);
+    // ①② 会话+验证码+自助登录(交互或两段式)
+    if let Err(e) = spa_login_with_captcha(&mut spa, username, password, offline_code, offline_session) {
+        eprintln!("!! {e}");
+        return 1;
+    }
+    // ③ 在线设备列表
+    let rows = match spa.getonline(username) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("!! {e}");
+            return 1;
+        }
+    };
+    if rows.is_empty() {
+        println!("当前没有在线会话(可能本机已下线)");
+        return 0;
+    }
+    // ④ 只允许下线本机(MAC/IP 匹配), 绝不顶号
+    let Some(i) = selfsvc::find_own_row(&rows, mac_nosep, my_ip) else {
+        println!(
+            "在线列表有 {} 台设备, 但没有本机(MAC/IP 均不匹配); 未做任何下线:",
+            rows.len()
+        );
+        for r in &rows {
+            println!(
+                "  {}  [{}:{}]  {}",
+                r.account_ip, r.terminal_type, r.os_info, r.account_mac
+            );
+        }
+        println!("提示: 用 --adapter 指定本机网卡后重试");
+        return 3;
+    };
+    let row = &rows[i];
+    // ⑤ 按 MAC 下线并清绑定(槽位分类存在「绑定粘性」, 清绑定后下次认证按 UA 重新分类)
+    match spa.kick_by_mac(username, row) {
+        Ok(msg) => println!("下线结果: {msg} (本机 {})", row.account_ip),
+        Err(e) => {
+            eprintln!("!! 下线失败: {e}");
+            return 1;
+        }
+    }
+    spa.logout(); // 用完即弃自助会话
+    // ⑥ 复核放行状态
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let auth = auth::Auth::new("pc", source, logger);
+    let (conclusive, _) = auth.connectivity_test();
+    match conclusive {
+        Some(false) => {
+            println!("复核: 已断网(回到未认证状态)");
+            0
+        }
+        Some(true) => {
+            println!("复核: 仍显示在线(?), 请到自助管理界面确认");
+            1
+        }
+        _ => {
+            println!("复核: 无结论");
+            0
         }
     }
 }

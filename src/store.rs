@@ -3,7 +3,6 @@
 //! 所有持久数据合并在 exe 同目录的 campus-auth.dat 一个文件里,
 //! 与程序放在一起,不散落单独的日志/配置文件。
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -79,10 +78,12 @@ impl Store {
         }
     }
 
+    /// 原子落盘: 先写临时文件再替换, 避免写一半时崩溃损坏数据文件(内含加密凭据)
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_vec_pretty(&self.data) {
-            if let Ok(mut f) = std::fs::File::create(&self.path) {
-                let _ = f.write_all(&json);
+            let tmp = self.path.with_extension("dat.tmp");
+            if std::fs::write(&tmp, &json).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.path);
             }
         }
         self.dirty.store(false, Ordering::Relaxed);
@@ -111,6 +112,7 @@ impl Store {
     }
 
     /// 清空全部日志(历史日志窗口「清除日志」按钮)
+    #[allow(dead_code)] // 仅 GUI bin 使用
     pub fn clear_logs(&mut self) {
         self.data.log_lines.clear();
         self.save();

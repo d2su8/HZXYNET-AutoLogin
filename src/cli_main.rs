@@ -5,6 +5,7 @@ mod cli_shared;
 mod common;
 mod crypto;
 mod net;
+mod selfsvc;
 mod store;
 
 use windows_sys::Win32::System::Console::{GetConsoleWindow, SetConsoleOutputCP};
