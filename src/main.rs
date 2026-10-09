@@ -8,18 +8,18 @@ mod net;
 mod selfsvc;
 mod store;
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, GetStockObject, GetSysColorBrush, InvalidateRect, SetBkColor,
+    CreateFontW, GetStockObject, GetSysColorBrush, InvalidateRect, SetBkColor,
     SetBkMode, SetTextColor, UpdateWindow, WHITE_BRUSH,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::Controls::BST_CHECKED;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
@@ -54,18 +54,12 @@ const IDC_BTN_OFFLINE: u32 = 117;
 const IDC_ED_PORTAL: u32 = 118;
 const IDC_BTN_DETECT: u32 = 119;
 const IDC_BTN_SLOTHELP: u32 = 120;
+const IDC_BTN_REPO: u32 = 121;
+const IDC_LBL_DISCLAIMER: u32 = 122;
 /// 给 Edit 设置灰色占位提示(windows-sys 未导出该常量)
 const EM_SETCUEBANNER: u32 = 0x1501;
 
 // 下线验证码对话框控件 ID
-const IDC_CAP_IMG: u32 = 910;
-const IDC_CAP_EDIT: u32 = 911;
-const IDC_CAP_OK: u32 = 912;
-const IDC_CAP_CANCEL: u32 = 913;
-const IDC_CAP_HINT: u32 = 914;
-const SS_BITMAP: u32 = 0x000E;
-const SS_CENTER: u32 = 0x0001;
-const STM_SETIMAGE: u32 = 0x0172;
 
 // 样式常量(SDK 值,统一 u32; crate 内同名常量是 i32,本地定义遮蔽保证类型一致)
 const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
@@ -92,23 +86,11 @@ const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 // 工作线程 -> UI 的消息
 // ---------------------------------------------------------------------------
 
-/// 下线流程上下文: 验证码阶段携带到对话框, 提交后交给②阶段线程
-struct CaptchaCtx {
-    png: Vec<u8>,
-    cookie: String,
-    account: String,
-    password: String,
-    source: Option<std::net::Ipv4Addr>,
-    mac_nosep: String,
-    my_ip: String,
-}
 
 enum UiMsg {
     Log(String),
     TestDone,
     LoginDone { ok: bool, code: &'static str, detail: String },
-    /// 下线流程①: 验证码已取到, 弹图等待人工输入
-    OfflineCaptcha { ctx: CaptchaCtx },
     /// 下线流程②: 结束(成功或失败)
     OfflineDone { ok: bool, detail: String },
     /// 门户探测结束(Some=门户基地址)
@@ -135,9 +117,6 @@ impl App {
 static APP: OnceLock<App> = OnceLock::new();
 static FONT_UI: OnceLock<isize> = OnceLock::new();
 static FONT_MONO: OnceLock<isize> = OnceLock::new();
-static CAPTCHA_CTX: Mutex<Option<CaptchaCtx>> = Mutex::new(None);
-static CAPTCHA_BMP: AtomicIsize = AtomicIsize::new(0);
-static CAPTCHA_CLASS: OnceLock<()> = OnceLock::new();
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
@@ -416,12 +395,13 @@ unsafe fn build_controls(hwnd: HWND) {
     // 设备槽位说明改为「提示」按钮弹窗(原来这行静态文字会被下面的门户地址行压住)
     create_ctrl("BUTTON", "提示", BS_PUSHBUTTON | WS_TABSTOP, 0, 624, 232, 68, 22, IDC_BTN_SLOTHELP, hwnd, font);
 
-    // ===== 操作按钮行(5 键等宽) =====
-    create_ctrl("BUTTON", "联通测试", BS_PUSHBUTTON | WS_TABSTOP, 0, 24, 306, 126, 30, IDC_BTN_TEST, hwnd, font);
-    create_ctrl("BUTTON", "下线本设备", BS_PUSHBUTTON | WS_TABSTOP, 0, 160, 306, 126, 30, IDC_BTN_OFFLINE, hwnd, font);
-    create_ctrl("BUTTON", "历史日志", BS_PUSHBUTTON | WS_TABSTOP, 0, 296, 306, 126, 30, IDC_BTN_HISTORY, hwnd, font);
-    create_ctrl("BUTTON", "清除已保存", BS_PUSHBUTTON | WS_TABSTOP, 0, 432, 306, 126, 30, IDC_BTN_CLEAR, hwnd, font);
-    create_ctrl("BUTTON", "自助管理", BS_PUSHBUTTON | WS_TABSTOP, 0, 568, 306, 126, 30, IDC_BTN_SELF, hwnd, font);
+    // ===== 操作按钮行(6 键等宽) =====
+    create_ctrl("BUTTON", "联通测试", BS_PUSHBUTTON | WS_TABSTOP, 0, 24, 306, 100, 30, IDC_BTN_TEST, hwnd, font);
+    create_ctrl("BUTTON", "下线本设备", BS_PUSHBUTTON | WS_TABSTOP, 0, 136, 306, 100, 30, IDC_BTN_OFFLINE, hwnd, font);
+    create_ctrl("BUTTON", "历史日志", BS_PUSHBUTTON | WS_TABSTOP, 0, 248, 306, 100, 30, IDC_BTN_HISTORY, hwnd, font);
+    create_ctrl("BUTTON", "清除已保存", BS_PUSHBUTTON | WS_TABSTOP, 0, 360, 306, 100, 30, IDC_BTN_CLEAR, hwnd, font);
+    create_ctrl("BUTTON", "自助管理", BS_PUSHBUTTON | WS_TABSTOP, 0, 472, 306, 100, 30, IDC_BTN_SELF, hwnd, font);
+    create_ctrl("BUTTON", "GitHub 仓库", BS_PUSHBUTTON | WS_TABSTOP, 0, 584, 306, 100, 30, IDC_BTN_REPO, hwnd, font);
     // 状态行(按钮行下方独立一行)
     create_ctrl("STATIC", "状态: 就绪", SS_LEFT, 0, 16, 346, 400, 18, IDC_LBL_STATUS, hwnd, font);
 
@@ -441,6 +421,21 @@ unsafe fn build_controls(hwnd: HWND) {
     );
     SendMessageW(ed_log, 0x00C5 /* EM_SETLIMITTEXT */, 0x7FFF_FFFE, 0);
     let _ = ed_log;
+
+    // ===== 免责声明(窗口底部常显) =====
+    create_ctrl(
+        "STATIC",
+        crate::common::DISCLAIMER,
+        SS_LEFT,
+        0,
+        16,
+        676,
+        688,
+        18,
+        IDC_LBL_DISCLAIMER,
+        hwnd,
+        font,
+    );
 }
 
 
@@ -488,11 +483,16 @@ unsafe fn handle_command(hwnd: HWND, id: u32, code: u32) {
         (IDC_BTN_OFFLINE, _) => on_offline(),
         (IDC_BTN_DETECT, _) => on_detect_portal(),
         (IDC_BTN_SLOTHELP, _) => on_slot_help(),
+        (IDC_BTN_REPO, _) => on_open_repo(),
         (IDC_BTN_LOGIN, _) => on_login(),
         (IDC_BTN_HISTORY, _) => open_history_window(),
         (IDC_BTN_CLEAR, _) => on_clear_saved(),
         (IDC_BTN_SELF, _) => {
-            let url = utf16(crate::common::SELF_SERVICE_URL);
+            let base = APP
+                .get()
+                .and_then(|a| a.store.lock().ok().map(|s| s.data.portal_url.clone()))
+                .unwrap_or_default();
+            let url = utf16(&crate::common::self_service_url(&base));
             let op = utf16("open");
             ShellExecuteW(
                 hwnd,
@@ -520,6 +520,11 @@ struct TaskParams {
     save: bool,
     /// 「门户地址」输入框内容(留空 = 靠 302 劫持自动发现)
     portal: String,
+    /// 所选网卡的 MAC(无分隔符大写), 下线时用来匹配"本机"
+    mac_nosep: String,
+    /// 配置里记住的网关参数(新版门户接口必填; 设备在线时靠它调接口)
+    acip: String,
+    acname: String,
 }
 
 fn current_ua_kind() -> String {
@@ -654,11 +659,19 @@ unsafe fn collect_params() -> Option<TaskParams> {
     let portal = get_text(GetDlgItem(app.hwnd(), IDC_ED_PORTAL as i32))
         .trim()
         .to_string();
+    let (acip, acname) = app
+        .store
+        .lock()
+        .map(|st| (st.data.wlanacip.clone(), st.data.wlanacname.clone()))
+        .unwrap_or_default();
     Some(TaskParams {
         user,
         pass,
         ua_kind,
         source,
+        mac_nosep: crate::selfsvc::norm_mac(&adapter.mac),
+        acip,
+        acname,
         adapter_name: adapter.name,
         save,
         portal,
@@ -774,6 +787,7 @@ unsafe fn on_login() {
         };
         let mut a = auth::Auth::new(&params.ua_kind, params.source, &log_fn);
         a.set_portal_url(Some(params.portal.clone()));
+        a.set_portal_ac(&params.acip, &params.acname);
         let (ok, code, detail) = a.login(&params.user, &params.pass);
         // 自动发现的成果写回数据文件(只存 scheme://host, 不含会过期的会话参数)
         let discovered = a
@@ -795,13 +809,33 @@ unsafe fn on_login() {
                     if params.portal.trim().is_empty() {
                         let _ = tx.send(UiMsg::Log(format!("已记住门户地址: {base}")));
                         store.data.portal_url = base;
-                        store.save();
                     }
                 }
+                if let Some((ip, name)) = a.discovered_ac.lock().ok().and_then(|g| g.clone()) {
+                    store.data.wlanacip = ip;
+                    store.data.wlanacname = name;
+                }
+                store.save();
             }
         }
         let _ = tx.send(UiMsg::LoginDone { ok, code, detail });
     });
+}
+
+/// 打开项目主页(GitHub 仓库)
+unsafe fn on_open_repo() {
+    let Some(app) = APP.get() else { return };
+    let url = utf16(crate::common::REPO_URL);
+    let op = utf16("open");
+    ShellExecuteW(
+        app.hwnd(),
+        op.as_ptr(),
+        url.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        1, /* SW_SHOWNORMAL */
+    );
+    log_line(&format!("已打开项目主页: {}", crate::common::REPO_URL));
 }
 
 /// 设备槽位说明(原来放在界面上的静态提示, 位置被门户地址行占用后改为弹窗)
@@ -882,313 +916,111 @@ unsafe fn messagebox_yesno(h: HWND, text: &str, cap: &str) -> bool {
     MessageBoxW(h, t.as_ptr(), c.as_ptr(), MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) == 6
 }
 
-/// 收集下线所需参数: 账号密码(输入框优先, 其次已保存凭据) + 选中的网卡
-unsafe fn collect_offline_params() -> Option<(String, String, Adapter)> {
-    let app = APP.get()?;
-    let mut user = get_text(GetDlgItem(app.hwnd(), IDC_ED_USER as i32))
-        .trim()
-        .to_string();
-    let mut pass = get_text(GetDlgItem(app.hwnd(), IDC_ED_PASS as i32));
-    if user.is_empty() || pass.is_empty() {
-        if let Ok(s) = app.store.lock() {
-            if user.is_empty() {
-                user = s.data.username.clone();
-            }
-            if pass.is_empty() && s.data.save_password {
-                pass = s.get_password().unwrap_or_default();
-            }
-        }
-    }
-    let adapter = selected_adapter()?;
-    Some((user, pass, adapter))
-}
 
 unsafe fn on_offline() {
     let Some(app) = APP.get() else { return };
     if app.busy.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Some((user, pass, adapter)) = collect_offline_params() else {
+    let Some(params) = collect_params() else {
         app.busy.store(false, Ordering::SeqCst);
         messagebox_warn(app.hwnd(), "请先选择一块有 IPv4 地址的网卡.");
         return;
     };
-    if user.is_empty() || pass.is_empty() {
+    if params.user.is_empty() || params.pass.is_empty() {
         app.busy.store(false, Ordering::SeqCst);
         messagebox_warn(
             app.hwnd(),
-            "下线需要账号密码登录自助系统:\n请先填写账号密码, 或使用「保存账号密码」后重试.",
+            "下线需要账号密码(新版门户用它换自助后台令牌):\n请先填写账号密码, 或使用「保存账号密码」后重试.",
         );
         return;
     }
     let confirm = format!(
-        "将下线本机在校园网的在线会话, 并同时清除 MAC 绑定:\n\n账号: {}\n网卡: {} ({})\n\n流程: 自动获取验证码 → 输入图中 4 位验证码 → 下线+清绑定+复核.\n仅操作本机会话, 不会影响账号下其它设备;\n下次认证将按所选设备类型重新分类槽位.\n\n继续?",
-        user,
-        adapter.name,
-        adapter
-            .ipv4
-            .first()
+        "将下线本机在校园网的在线会话, 并清除 MAC 绑定:\n\n账号: {}\n网卡: {} ({})\n\n        流程: 用账号密码换取自助后台令牌 → 查在线设备 → 匹配本机 → 强制下线 + 清绑定 + 复核.\n        仅操作本机会话, 不会影响账号下其它设备; 新版门户不再需要图片验证码.\n\n继续?",
+        params.user,
+        params.adapter_name,
+        params
+            .source
             .map(|i| i.to_string())
-            .unwrap_or_default()
+            .unwrap_or_else(|| "自动".into())
     );
     if !messagebox_yesno(app.hwnd(), &confirm, "确认下线") {
         app.busy.store(false, Ordering::SeqCst);
         log_line("用户取消了下线操作");
         return;
     }
-    set_busy(true, "获取验证码...");
-    log_line("---- 下线本设备: 获取验证码 ----");
-    let source = adapter.ipv4.first().copied();
-    let mac_nosep = selfsvc::norm_mac(&adapter.mac);
-    let my_ip = adapter
-        .ipv4
-        .first()
-        .map(|i| i.to_string())
-        .unwrap_or_default();
+    set_busy(true, "下线中...");
+    log_line("---- 下线本设备(新版自助后台令牌 API) ----");
     let tx = app.tx.lock().unwrap().clone();
     thread::spawn(move || {
         let tx_log = Mutex::new(tx.clone());
         let log_fn = move |s: &str| {
             let _ = tx_log.lock().unwrap().send(UiMsg::Log(s.to_string()));
         };
-        let mut spa = selfsvc::Spa::new(source, &log_fn);
-        match spa.tologin() {
-            Ok(cap) => {
-                let _ = tx.send(UiMsg::OfflineCaptcha {
-                    ctx: CaptchaCtx {
-                        png: cap.png,
-                        cookie: cap.cookie,
-                        account: user,
-                        password: pass,
-                        source,
-                        mac_nosep,
-                        my_ip,
-                    },
-                });
+        match run_offline_new(&params, &log_fn) {
+            Ok(detail) => {
+                // 复核: 等 3 秒再探测, 回到劫持态即成功
+                thread::sleep(std::time::Duration::from_secs(3));
+                let a = auth::Auth::new("pc", params.source, &log_fn);
+                let (conclusive, _) = a.connectivity_test();
+                let detail = match conclusive {
+                    Some(false) => format!("{detail}; 复核: 已断网(回到未认证状态)"),
+                    Some(true) => format!("{detail}; 注意: 复核显示仍在线(门户可能有延迟)"),
+                    None => detail,
+                };
+                let _ = tx.send(UiMsg::OfflineDone { ok: true, detail });
             }
             Err(e) => {
                 let _ = tx.send(UiMsg::OfflineDone {
                     ok: false,
-                    detail: format!("获取验证码失败: {e}"),
+                    detail: e,
                 });
             }
         }
     });
 }
 
-unsafe fn show_captcha_dialog(ctx: CaptchaCtx) {
-    let Some(app) = APP.get() else { return };
-    if CAPTCHA_CLASS.get().is_none() {
-        let cls = cls_name();
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(captcha_wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: GetModuleHandleW(std::ptr::null()),
-            hIcon: std::ptr::null_mut(),
-            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hbrBackground: GetSysColorBrush(15),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: cls.as_ptr(),
-        };
-        RegisterClassW(&wc);
-        let _ = CAPTCHA_CLASS.set(());
-    }
-    *CAPTCHA_CTX.lock().unwrap() = Some(ctx);
-    let mut rect = RECT { left: 0, top: 0, right: dp(210), bottom: dp(168) };
-    AdjustWindowRect(&mut rect, WS_CAPTION | WS_SYSMENU, 0);
-    let title: Vec<u16> = "下线本设备 - 输入验证码".encode_utf16().chain([0]).collect();
-    let h = CreateWindowExW(
-        0,
-        cls_name().as_ptr(),
-        title.as_ptr(),
-        WS_CAPTION | WS_SYSMENU,
-        120,
-        120,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        app.hwnd(),
-        std::ptr::null_mut(),
-        GetModuleHandleW(std::ptr::null()),
-        std::ptr::null(),
-    );
-    ShowWindow(h, SW_SHOW);
-    UpdateWindow(h);
-}
-
-/// 类名字符串(每次调用生成, 仅需在 CreateWindowExW 调用期间有效)
-fn cls_name() -> Vec<u16> {
-    "campus_auth_captcha_wnd".encode_utf16().chain([0]).collect()
-}
-
-unsafe fn build_captcha_controls(hwnd: HWND) {
-    let font = FONT_UI.get().copied().unwrap_or(0);
-    create_ctrl("STATIC", "", SS_BITMAP, 0, 40, 12, 130, 44, IDC_CAP_IMG, hwnd, font);
-    create_ctrl("STATIC", "请输入图片中的 4 位验证码", SS_CENTER, 0, 10, 64, 190, 16, IDC_CAP_HINT, hwnd, font);
-    let edit = create_ctrl(
-        "EDIT",
-        "",
-        ES_LEFT | ES_AUTOHSCROLL | WS_TABSTOP,
-        WS_EX_CLIENTEDGE,
-        55,
-        88,
-        100,
-        24,
-        IDC_CAP_EDIT,
-        hwnd,
-        font,
-    );
-    SendMessageW(edit, 0x00C5 /* EM_SETLIMITTEXT */, 4, 0);
-    create_ctrl("BUTTON", "确定", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 22, 124, 76, 26, IDC_CAP_OK, hwnd, font);
-    create_ctrl("BUTTON", "取消", BS_PUSHBUTTON | WS_TABSTOP, 0, 112, 124, 76, 26, IDC_CAP_CANCEL, hwnd, font);
-    SetFocus(edit);
-    // 解码验证码图并贴到静态控件; 失败则回退为系统看图程序打开
-    let png = CAPTCHA_CTX
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|c| c.png.clone()));
-    if let Some(png) = png {
-        match selfsvc::decode_png_to_hbitmap(&png) {
-            Ok(hbmp) => {
-                CAPTCHA_BMP.store(hbmp, Ordering::SeqCst);
-                SendMessageW(
-                    GetDlgItem(hwnd, IDC_CAP_IMG as i32),
-                    STM_SETIMAGE,
-                    0, // IMAGE_BITMAP
-                    hbmp,
-                );
-            }
-            Err(e) => {
-                let path = std::env::temp_dir().join("campus-auth-captcha.png");
-                let wp: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
-                let op: Vec<u16> = "open".encode_utf16().chain([0]).collect();
-                ShellExecuteW(hwnd, op.as_ptr(), wp.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL as i32);
-                set_text(
-                    GetDlgItem(hwnd, IDC_CAP_HINT as i32),
-                    "已用系统看图程序打开验证码图片",
-                );
-                let _ = e;
-            }
-        }
-    }
-}
-
-unsafe extern "system" fn captcha_wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_CREATE => {
-            build_captcha_controls(hwnd);
-            return 0;
-        }
-        WM_COMMAND => {
-            let id = (wparam & 0xffff) as u32;
-            match id {
-                IDC_CAP_OK => {
-                    on_captcha_ok(hwnd);
-                    return 0;
-                }
-                IDC_CAP_CANCEL => {
-                    DestroyWindow(hwnd);
-                    return 0;
-                }
-                _ => {}
-            }
-        }
-        WM_CLOSE => {
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        WM_DESTROY => {
-            let bmp = CAPTCHA_BMP.swap(0, Ordering::SeqCst);
-            if bmp != 0 {
-                DeleteObject(bmp as _);
-            }
-            let _ = CAPTCHA_CTX.lock().unwrap().take();
-            if let Some(app) = APP.get() {
-                if !app.offline_submitting.load(Ordering::SeqCst) {
-                    app.busy.store(false, Ordering::SeqCst);
-                    set_busy(false, "就绪");
-                    log_line("下线流程已取消(未提交任何请求)");
-                }
-            }
-            return 0;
-        }
-        _ => {}
-    }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-unsafe fn on_captcha_ok(hwnd: HWND) {
-    let Some(app) = APP.get() else { return };
-    let code = get_text(GetDlgItem(hwnd, IDC_CAP_EDIT as i32)).trim().to_string();
-    if code.chars().count() < 4 {
-        messagebox_warn(hwnd, "请输入完整的 4 位验证码");
-        return;
-    }
-    let Some(ctx) = CAPTCHA_CTX.lock().ok().and_then(|mut g| g.take()) else { return };
-    app.offline_submitting.store(true, Ordering::SeqCst);
-    DestroyWindow(hwnd);
-    set_busy(true, "下线本设备中...");
-    log_line("---- 下线本设备: 提交验证码 ----");
-    let tx = app.tx.lock().unwrap().clone();
-    thread::spawn(move || {
-        let tx_log = Mutex::new(tx.clone());
-        let log_fn = move |s: &str| {
-            let _ = tx_log.lock().unwrap().send(UiMsg::Log(s.to_string()));
-        };
-        let result = run_offline_flow(&ctx, &code, &log_fn);
-        let ok = result.is_ok();
-        let mut detail = match &result {
-            Ok(d) => d.clone(),
-            Err(e) => e.clone(),
-        };
-        if ok {
-            thread::sleep(std::time::Duration::from_secs(3));
-            let auth = auth::Auth::new("pc", ctx.source, &log_fn);
-            let (conclusive, _) = auth.connectivity_test();
-            match conclusive {
-                Some(false) => detail.push_str("; 复核: 已断网(回到未认证状态)"),
-                Some(true) => detail.push_str("; 注意: 复核显示仍在线"),
-                None => {}
-            }
-        }
-        let _ = tx.send(UiMsg::OfflineDone { ok, detail });
-    });
-}
-
-/// 下线主流程②: 登录自助 → 查设备列表 → 匹配本机行 → 踢下线
-fn run_offline_flow(
-    ctx: &CaptchaCtx,
-    code: &str,
+/// 新版下线流程: 令牌(Web 认证接口给) → 在线设备 → 匹配本机 → 强制下线 → 清绑定
+fn run_offline_new(
+    params: &TaskParams,
     log: &(dyn Fn(&str) + Sync),
 ) -> Result<String, String> {
-    let mut spa = selfsvc::Spa::new(ctx.source, log);
-    spa.cookie = ctx.cookie.clone();
-    spa.login(&ctx.account, &ctx.password, code)?;
-    let rows = spa.getonline(&ctx.account)?;
+    // ① 令牌: 设备在线时接口照样返回令牌, 不会打扰在线会话
+    let mut a = auth::Auth::new(&params.ua_kind, params.source, log);
+    a.set_portal_url(Some(params.portal.clone()));
+    a.set_portal_ac(&params.acip, &params.acname);
+    let token = a.obtain_portal_token(&params.user, &params.pass)?;
+    let base = a
+        .discovered_base
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| "拿不到门户基地址".to_string())?;
+    let api = selfsvc::PortalApi::new(params.source, &base, &token, log);
+    // ② 在线设备
+    let rows = api.online_users()?;
     if rows.is_empty() {
-        return Ok("当前没有在线会话(可能本机已下线)".into());
+        return Ok("当前没有在线会话(可能本机已下线)".to_string());
     }
-    match selfsvc::find_own_row(&rows, &ctx.mac_nosep, &ctx.my_ip) {
-        Some(i) => {
-            let row = &rows[i];
-            // 一律按 MAC 下线并清绑定: 槽位分类存在「绑定粘性」(详见 docs/PROTOCOL.md §7),
-            // 清绑定后下次认证将按所选设备类型重新分类
-            let msg = spa.kick_by_mac(&ctx.account, row)?;
-            // 用完即弃自助会话(下线动作已完成, 不留登录态)
-            spa.logout();
-            Ok(format!("{} (本机 {})", msg, row.account_ip))
-        }
-        None => Err(format!(
+    // ③ 只下线本机(MAC 优先, 其次 IP), 绝不顶号
+    let own_mac = params.mac_nosep.clone();
+    let my_ip = params.source.map(|i| i.to_string()).unwrap_or_default();
+    let Some(i) = selfsvc::find_own_row(&rows, &own_mac, &my_ip) else {
+        return Err(format!(
             "在线列表有 {} 台设备, 但没有本机(MAC/IP 均不匹配).\n遵守「绝不顶号」原则, 未做任何下线操作.",
             rows.len()
-        )),
-    }
+        ));
+    };
+    let row = rows[i].clone();
+    // ④ 强制下线
+    let msg = api.force_offline(&row.ip, &row.mac)?;
+    // ⑤ 清除 MAC 绑定(没有记录不算失败)
+    let cleared = match api.clear_mac(&own_mac) {
+        Ok(m) => m,
+        Err(e) => format!("清除绑定失败(不影响下线): {e}"),
+    };
+    Ok(format!("{msg}; 清绑定: {cleared} (本机 {})", row.ip))
 }
 
 unsafe fn open_history_window() {
@@ -1333,7 +1165,11 @@ unsafe fn drain_messages() {
                         set_busy(false, "槽位冲突");
                         let text = utf16(&format!(
                             "该设备槽位已被占用(或在线终端数超限).\n\n请打开自助管理界面手动下线占用设备后重试:\n{}\n\n(点击「自助管理」按钮可直达; 「下线本设备」可下线本机并清绑定)",
-                            crate::common::SELF_SERVICE_URL
+                            crate::common::self_service_url(
+                                &APP.get()
+                                    .and_then(|a| a.store.lock().ok().map(|s| s.data.portal_url.clone()))
+                                    .unwrap_or_default()
+                            )
                         ));
                         let cap = utf16("槽位冲突");
                         MessageBoxW(app.hwnd(), text.as_ptr(), cap.as_ptr(), MB_ICONWARNING);
@@ -1395,10 +1231,6 @@ unsafe fn drain_messages() {
                         MessageBoxW(app.hwnd(), text.as_ptr(), cap.as_ptr(), MB_ICONWARNING);
                     }
                 }
-            }
-            UiMsg::OfflineCaptcha { ctx } => {
-                set_busy(true, "等待输入验证码...");
-                show_captcha_dialog(ctx);
             }
             UiMsg::OfflineDone { ok, detail } => {
                 app.offline_submitting.store(false, Ordering::SeqCst);

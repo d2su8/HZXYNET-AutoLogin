@@ -95,6 +95,10 @@ cargo build --release
 
 ## 认证协议概要
 
+> **2026-10 门户改版已适配**: 学校门户已换成新版(SPA + `/portal/webauth/auth` 接口 + 令牌自助后台 `/api/portal/user/*`, 下线不再需要图片验证码);
+> 程序自动识别新版/旧版两种门户, 详见 [docs/PROTOCOL.md](docs/PROTOCOL.md) 与 CHANGELOG [1.3.0]。
+
+
 未认证时，网关（AC）会将任意 HTTP 出网请求 302 重定向到门户登录页，URL 查询串中携带会话绑定参数（`wlanuserip` / `mac` 等）；登录即向同一 URL POST 配置字段 + 账号密码。是否上线以「复核探测」为准（响应头无 `Location` = 已放行）。设备类型由 User-Agent 判定（**单 UA 头**，门户取首个）。完整协议见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。
 
 ## 项目结构

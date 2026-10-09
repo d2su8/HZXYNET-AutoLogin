@@ -2,6 +2,26 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。Windows GUI/CLI 主线（main 分支）与 OpenWrt 插件（openwrt 分支）分别迭代。
 
+## [1.3.0]
+
+### 适配 2026-10 校园网门户改版(SPA + 令牌 API)
+
+学校把门户换成了新版(IP `10.255.2.252` → `10.255.2.249`, 登录路径 `/webauth.do` → `/portal/webauth`,
+自助后台 `/self/index.html` → `/self/` SPA + `/api/portal/user/*`), 旧流程全部失效, 本次同步适配:
+
+- **登录**: 登录页没有 password 输入框时判定为"新版 SPA 门户", 改走 `POST /portal/webauth/auth`
+  (表单编码 `userId/passwd/loginMode/wlanuserip/wlanacip/wlanacname`, 响应 JSON);
+  老板牌表单式门户原逻辑不变 —— 判据让学校再换回去时也不用改代码
+- **记住门户地址与网关参数**: 新接口必填 `wlanacip`/`wlanacname`, 设备在线时没有劫持 URL 可取,
+  因此首次登录时把它们(连同门户基地址)写进 `campus-auth.dat`; 「门户地址」填完整登录页 URL 时从 query 取
+- **下线/查看在线设备重写为令牌 API**: 拿令牌 → `onlineUsers` → 按 MAC/IP 匹配本机 → `forceOffline`
+  → `accountMac` 清绑定 → 探测复核。**新版门户没有图片验证码**, GUI 验证码弹窗与 GDI+ PNG 解码、
+  CLI 的 `--offline-code/--offline-session` 一并删除
+- **自助管理链接**改为按门户基地址拼 `<基地址>/self/`
+- 新增 `--dump` 抓包转储(仅 CLI): 探测/登录页/接口响应落盘, 便于下次门户改版时快速摸底
+- 实测(2026-10-09): 测试账号登录成功并复核放行; 在线状态下 `--list-online` 正确列出本机、
+  `--offline` 强制下线成功并复核断网
+
 ## [1.2.0]
 
 ### 新增

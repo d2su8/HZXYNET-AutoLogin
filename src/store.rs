@@ -33,6 +33,12 @@ pub struct StoreData {
     /// 自动发现成功时也会把门户基地址写回这里, 下次可直接用。
     #[serde(default)]
     pub portal_url: String,
+    /// 新版门户认证接口要求的网关参数(从劫持 URL 学到, 设备在线时也用它);
+    /// 值形如 wlanacip=10.255.2.250 / wlanacname=hzxy
+    #[serde(default)]
+    pub wlanacip: String,
+    #[serde(default)]
+    pub wlanacname: String,
     /// 滚动日志(与配置同文件,最多 MAX_LOG_LINES 行)
     #[serde(default)]
     pub log_lines: Vec<String>,
@@ -51,6 +57,8 @@ impl Default for StoreData {
             ua: default_ua(),
             adapter: String::new(),
             portal_url: String::new(),
+            wlanacip: String::new(),
+            wlanacname: String::new(),
             log_lines: Vec::new(),
         }
     }

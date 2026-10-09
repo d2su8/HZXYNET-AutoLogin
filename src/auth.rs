@@ -49,6 +49,13 @@ pub struct Auth<'a> {
     pub portal_url: Option<String>,
     /// 本次认证实际用到的门户基地址(供上层写回配置)
     pub discovered_base: std::sync::Mutex<Option<String>>,
+    /// 新版门户登录后返回的自助后台令牌(Bearer), 供下线流程复用;
+    /// 老板牌门户(表单式)没有这个, 保持 None
+    pub token: std::sync::Mutex<Option<String>>,
+    /// 上次从劫持 URL / 登录页学到的网关参数 (wlanacip, wlanacname), 供在线时复用
+    pub discovered_ac: std::sync::Mutex<Option<(String, String)>>,
+    /// 配置里保存的网关参数兜底(设备在线、拿不到劫持 URL 时用)
+    pub ac_hint: Option<(String, String)>,
 }
 
 /// 取 URL 里的主机名(不含 scheme/端口/路径)
@@ -143,6 +150,44 @@ pub fn probe_targets() -> Vec<(String, String)> {
         .collect()
 }
 
+/// 取 URL query 中某个参数的值(百分号解码)。也接受相对路径形式 `?a=1&b=2`。
+pub fn query_param(url: &str, key: &str) -> Option<String> {
+    let q = url.split_once('?')?.1;
+    for kv in q.split('&') {
+        let (k, v) = match kv.split_once('=') {
+            Some(x) => x,
+            None => (kv, ""),
+        };
+        if k == key {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+/// 百分号解码(+ 视作空格), 错误序列按原样保留
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        if b[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 /// 该地址是否像门户登录页(含 password 输入框或门户特征词)
 pub fn looks_like_portal_page(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
@@ -204,12 +249,24 @@ impl<'a> Auth<'a> {
             log,
             portal_url: None,
             discovered_base: std::sync::Mutex::new(None),
+            token: std::sync::Mutex::new(None),
+            discovered_ac: std::sync::Mutex::new(None),
+            ac_hint: None,
         }
     }
 
     /// 设置手动门户地址(空串/None = 只用劫持自动发现)
     pub fn set_portal_url(&mut self, url: Option<String>) {
         self.portal_url = url.filter(|s| !s.trim().is_empty());
+    }
+
+    /// 设置网关参数兜底(配置里存下来的 wlanacip/wlanacname)
+    pub fn set_portal_ac(&mut self, acip: &str, acname: &str) {
+        let a = acip.trim();
+        let n = acname.trim();
+        if !a.is_empty() && !n.is_empty() {
+            self.ac_hint = Some((a.to_string(), n.to_string()));
+        }
     }
 
     pub fn device_label(&self) -> &'static str {
@@ -368,6 +425,173 @@ impl<'a> Auth<'a> {
         None
     }
 
+    /// 取自助后台令牌(下线流程用): 优先复用本次已拿到的; 否则重新探测门户 → 抓登录页 → 调认证接口。
+    /// 设备已在线时接口也会返回令牌(提示放在 redirect.errorMsg), 不会打扰在线会话。
+    pub fn obtain_portal_token(&self, username: &str, password: &str) -> Result<String, String> {
+        if let Ok(g) = self.token.lock() {
+            if let Some(t) = g.as_ref() {
+                if !t.is_empty() {
+                    return Ok(t.clone());
+                }
+            }
+        }
+        // 门户地址: 先看劫持, 再看配置
+        let mut loc: Option<String> = None;
+        for (h, p) in probe_targets() {
+            if let ProbeState::Captive(u) = self.probe_one(&h, &p) {
+                loc = Some(u);
+                break;
+            }
+        }
+        let loc = match loc.or_else(|| self.portal_url.clone()) {
+            Some(l) => l,
+            None => {
+                return Err(
+                    "定位不到门户: 没有劫持响应, 也没配置门户地址(界面「门户地址」或 --portal)".into(),
+                )
+            }
+        };
+        if let Ok(mut g) = self.discovered_base.lock() {
+            *g = Some(url_base(&loc));
+        }
+        let (_final_url, html, _cookie) = self.fetch_login_page(&loc)?;
+        let fields = parse_form_fields(&html);
+        let (uf, pf) = detect_credential_fields(&parse_form_inputs(&html));
+        if pf.is_some() {
+            return Err("该校门户仍是旧版表单式(没有自助令牌机制), 下线请用门户自己的自助管理页面".into());
+        }
+        let _ = uf;
+        let mut errmsg = String::new();
+        if let Err((code, msg)) = self.login_spa(&loc, &fields, username, password, &mut errmsg) {
+            return Err(format!("{msg}({code})"));
+        }
+        self.token
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| "门户没有返回自助令牌".to_string())
+    }
+
+    /// 新版门户(SPA)登录: POST {base}/portal/webauth/auth (表单编码, 响应 JSON)。
+    /// Ok(true)  = 本机已在线(门户把提示放在 redirect 的 errorMsg 里), 视为成功;
+    /// Ok(false) = 已受理, 交给上层做放行复核;
+    /// Err(code, msg) = 失败(密码错/槽位冲突/其它)
+    fn login_spa(
+        &self,
+        loc: &str,
+        fields: &[(String, String)],
+        username: &str,
+        password: &str,
+        errmsg_out: &mut String,
+    ) -> Result<bool, (&'static str, String)> {
+        let base = url_base(loc);
+        let auth_url = format!("{base}/portal/webauth/auth");
+        // 会话参数: 优先登录页隐藏域(#portalLegacyParams), 否则从劫持 Location 的 query 取
+        let get = |k: &str| -> String {
+            let v = fields
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .filter(|v| !v.is_empty())
+                .or_else(|| query_param(loc, k))
+                .unwrap_or_default();
+            if !v.is_empty() {
+                return v;
+            }
+            // 设备在线(拿不到劫持 URL)时用配置里记住的网关参数兜底
+            match (k, self.ac_hint.as_ref()) {
+                ("wlanacip", Some((a, _))) => a.clone(),
+                ("wlanacname", Some((_, n))) => n.clone(),
+                _ => String::new(),
+            }
+        };
+        let (ip, acip, acname) = (get("wlanuserip"), get("wlanacip"), get("wlanacname"));
+        if !acip.is_empty() && !acname.is_empty() {
+            if let Ok(mut g) = self.discovered_ac.lock() {
+                *g = Some((acip.clone(), acname.clone()));
+            }
+        }
+        let mut pairs: Vec<(String, String)> = vec![
+            ("userId".to_string(), username.to_string()),
+            ("passwd".to_string(), password.to_string()),
+            ("loginMode".to_string(), "password".to_string()),
+            ("wlanuserip".to_string(), ip.clone()),
+            ("wlanacip".to_string(), acip.clone()),
+            ("wlanacname".to_string(), acname.clone()),
+        ];
+        let distoken = get("distoken");
+        if !distoken.is_empty() {
+            pairs.push(("distoken".to_string(), distoken));
+        }
+        let body = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        (self.log)("  检测到新版门户(SPA, 登录页无表单), 走接口 /portal/webauth/auth");
+        (self.log)(&format!(
+            "  提交: userId={username} passwd=*** loginMode=password wlanuserip={ip} wlanacip={acip} wlanacname={acname}"
+        ));
+        let headers = [
+            ("User-Agent", self.ua.as_str()),
+            ("Accept", "application/json, text/plain, */*"),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("Referer", loc),
+            ("Origin", base.as_str()),
+        ];
+        let resp = self
+            .client
+            .request("POST", &auth_url, &headers, Some(&body))
+            .map_err(|e| (CODE_UNREACHABLE, format!("接口请求失败: {e}")))?;
+        let text = decode_body(&resp.body);
+        (self.log)(&format!(
+            "第 3 步完成: 接口 HTTP {} ({} 字节)",
+            resp.status,
+            resp.body.len()
+        ));
+        let v: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
+            (
+                CODE_FAIL,
+                format!("接口响应不是 JSON({e}): {}", text.chars().take(160).collect::<String>()),
+            )
+        })?;
+        let success = v["success"].as_bool().unwrap_or(false);
+        let message = v["message"].as_str().unwrap_or("").to_string();
+        if !success {
+            (self.log)(&format!("  门户返回: {message}"));
+            if message.contains("密码") || BADPASS_KEYWORDS.iter().any(|k| message.contains(k)) {
+                return Err((CODE_BADPASS, message));
+            }
+            if CONFLICT_KEYWORDS.iter().any(|k| message.contains(k)) {
+                (self.log)("!! 检测到槽位冲突(已在线/终端数超限类)");
+                self.print_manual_offline_advice();
+                return Err((CODE_CONFLICT, message));
+            }
+            return Err((CODE_FAIL, message));
+        }
+        let result = &v["result"];
+        if let Some(tok) = result["token"].as_str() {
+            if !tok.is_empty() {
+                if let Ok(mut g) = self.token.lock() {
+                    *g = Some(tok.to_string());
+                }
+                (self.log)("  已取得自助后台令牌(可用于下线本设备)");
+            }
+        }
+        if let Some(e) = result["redirect"].as_str().and_then(|r| query_param(r, "errorMsg")) {
+            (self.log)(&format!("  门户返回消息: {e}"));
+            *errmsg_out = e.clone();
+            if e.contains("已在线") {
+                (self.log)("本机已在线, 无需重复认证");
+                return Ok(true);
+            }
+        } else if !message.is_empty() {
+            *errmsg_out = message;
+        }
+        Ok(false)
+    }
+
     /// 完整登录流程. 返回 (成功?, code, detail)
     pub fn login(&self, username: &str, password: &str) -> (bool, &'static str, String) {
         (self.log)(&format!(
@@ -484,6 +708,18 @@ impl<'a> Auth<'a> {
         }
 
         // ---- 第 3 步: POST 登录 ------------------------------------------
+        // 新版门户(SPA: 登录页只是个 JS 外壳, 没有表单)走接口 /portal/webauth/auth;
+        // 老板牌表单式门户仍按页面字段构造表单提交。判据 = 页面里有没有 password 输入框。
+        let inputs = parse_form_inputs(&page_text);
+        let (uf_opt, pf_opt) = detect_credential_fields(&inputs);
+        let mut errmsg = String::new();
+        if pf_opt.is_none() {
+            match self.login_spa(&loc, &fields, username, password, &mut errmsg) {
+                Ok(true) => return (true, CODE_ALREADY, errmsg),
+                Ok(false) => {}
+                Err((code, msg)) => return (false, code, msg),
+            }
+        } else {
         // 注意: 门户(Java Servlet)的 getParameter 对字段名大小写敏感,
         // 字段名必须使用页面原始大小写(serverIp/hostIp/isBindMac1...),
         // 因此以【页面解析到的原始键名】为准, BASE_FORM_DEFAULTS 仅作值兜底
@@ -510,10 +746,9 @@ impl<'a> Auth<'a> {
         }
         (self.log)(&format!("  认证身份: 设备={} templatetype={}", self.device_label(), tt));
         // 账号/密码字段名按登录页推断(老板牌是 userId/passwd, 别家门户可能叫 account/pwd/username...),
-    // 推不出来时才回退到老板牌的固定名 —— 这样换学校也不用改代码
-        let (uf, pf) = detect_credential_fields(&parse_form_inputs(&page_text));
-        let user_field = uf.unwrap_or_else(|| "userId".to_string());
-        let pass_field = pf.unwrap_or_else(|| "passwd".to_string());
+        // 推不出来时才回退到老板牌的固定名 —— 这样换学校也不用改代码
+        let user_field = uf_opt.unwrap_or_else(|| "userId".to_string());
+        let pass_field = pf_opt.unwrap_or_else(|| "passwd".to_string());
         (self.log)(&format!("  表单身份字段: 账号={user_field} 密码={pass_field}"));
         if let Some(pair) = form_pairs.iter_mut().find(|(k, _)| *k == user_field) {
             pair.1 = username.to_string();
@@ -566,7 +801,7 @@ impl<'a> Auth<'a> {
         ));
 
         let resp_text = decode_body(&resp.body);
-        let errmsg = extract_err_message(&resp_text);
+        errmsg = extract_err_message(&resp_text);
         if !errmsg.is_empty() {
             (self.log)(&format!("  门户返回消息: {errmsg}"));
             if BADPASS_KEYWORDS.iter().any(|k| errmsg.contains(k)) {
@@ -581,6 +816,8 @@ impl<'a> Auth<'a> {
         } else {
             (self.log)("  门户未返回错误消息, 视为受理");
         }
+
+        } // 结束: 表单式门户分支
 
         // ---- 第 4 步: 复核放行 --------------------------------------------
         for attempt in 1..=2 {
@@ -622,7 +859,17 @@ impl<'a> Auth<'a> {
     /// 手动下线指引(绝不自动顶号)
     pub fn print_manual_offline_advice(&self) {
         (self.log)("---- 请手动下线后重试 ----");
-        (self.log)(&format!("1. 打开自助管理界面: {}", crate::common::SELF_SERVICE_URL));
+        let portal_base = self
+            .discovered_base
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.portal_url.clone())
+            .unwrap_or_default();
+        (self.log)(&format!(
+            "1. 打开自助管理界面: {}",
+            crate::common::self_service_url(&portal_base)
+        ));
         (self.log)("2. 在「在线设备 / 终端管理」中手动下线占用槽位的设备");
         (self.log)("3. 回到本程序重新点击认证");
         (self.log)("说明: 账号限 1 台电脑 + 1 台手机同时在线; 本程序不会自动顶号.");

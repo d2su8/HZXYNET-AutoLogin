@@ -4,10 +4,25 @@
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
-/// bossWeb 门户地址
-pub const PORTAL_HOST: &str = "10.255.2.252";
-/// 自助管理界面(手动下线用)
-pub const SELF_SERVICE_URL: &str = "http://10.255.2.252/self/index.html#/Login";
+/// 项目主页(GitHub 仓库)
+pub const REPO_URL: &str = "https://github.com/d2su8/HZXYNET-AutoLogin";
+
+/// 免责声明(界面/命令行都会展示)
+pub const DISCLAIMER: &str = "免责声明: 本软件供学习交流使用, 请遵守所在学校/机构的网络使用规定。";
+
+/// 自助管理界面: 新版门户(/self/ 下的 SPA)默认入口。
+/// 实际使用优先按门户基地址拼: self_service_url(portal_base)
+pub const SELF_SERVICE_URL: &str = "http://10.255.2.249/self/";
+
+/// 按门户基地址拼自助管理界面地址(基地址为空则用默认值)
+pub fn self_service_url(portal_base: &str) -> String {
+    let b = portal_base.trim().trim_end_matches('/');
+    if b.is_empty() {
+        SELF_SERVICE_URL.to_string()
+    } else {
+        format!("{b}/self/")
+    }
+}
 
 /// 探测地址 (host, path),msft 优先
 pub const PROBE_URLS: [(&str, &str); 3] = [
