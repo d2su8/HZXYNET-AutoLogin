@@ -46,7 +46,7 @@ fn pwstr_to_string(p: *const u16) -> String {
 }
 
 fn sockaddr_to_ipv4(sa: &SOCKADDR) -> Option<Ipv4Addr> {
-    if sa.sa_family != AF_INET as u16 {
+    if sa.sa_family != AF_INET {
         return None;
     }
     // SOCKADDR 布局: family(2) + sin_port(2) + in_addr(4) + zero(8), sa_data 是 i8
@@ -131,34 +131,6 @@ pub fn list_adapters() -> Vec<Adapter> {
         }
         out
     }
-}
-
-/// 网卡名 -> 第一个 IPv4 (仅 CLI 使用)
-#[allow(dead_code)]
-pub fn resolve_adapter_ip(name: &str) -> Option<Ipv4Addr> {
-    list_adapters()
-        .into_iter()
-        .find(|a| a.name.eq_ignore_ascii_case(name))
-        .and_then(|a| a.ipv4.into_iter().next())
-}
-
-/// 自动猜测校园网网卡: 10.200/10.202 段优先,其次名字含 WLAN/WiFi/无线 (仅 CLI 使用)
-#[allow(dead_code)]
-pub fn guess_campus_adapter() -> Option<Adapter> {
-    let adapters = list_adapters();
-    for a in &adapters {
-        if a.is_campus() {
-            return Some(a.clone());
-        }
-    }
-    adapters
-        .into_iter()
-        .find(|a| {
-            (a.name.to_ascii_lowercase().contains("wlan")
-                || a.name.to_ascii_lowercase().contains("wifi")
-                || a.name.contains("无线"))
-                && !a.ipv4.is_empty()
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -336,12 +308,9 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
 fn decode_chunked(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0usize;
-    loop {
-        // 读一行 chunk size
-        let line_end = match data[i..].windows(2).position(|w| w == b"\r\n") {
-            Some(p) => i + p,
-            None => break,
-        };
+    // 读一行 chunk size
+    while let Some(p) = data[i..].windows(2).position(|w| w == b"\r\n") {
+        let line_end = i + p;
         let size_str = String::from_utf8_lossy(&data[i..line_end]);
         let size_str = size_str.split(';').next().unwrap_or("").trim();
         let size = match usize::from_str_radix(size_str, 16) {

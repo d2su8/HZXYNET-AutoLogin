@@ -65,7 +65,7 @@ pub fn url_host(url: &str) -> &str {
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
     let end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     let hostport = &rest[..end];
     // 去掉端口
@@ -83,7 +83,7 @@ pub fn url_base(url: &str) -> String {
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
     let end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     format!("{scheme}://{}", &rest[..end])
 }

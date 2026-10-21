@@ -1,12 +1,7 @@
 //! 贺州学院校园网认证 - 纯 Win32 原生 GUI(零依赖,单 exe)
 #![windows_subsystem = "windows"]
 
-mod auth;
-mod common;
-mod crypto;
-mod net;
-mod selfsvc;
-mod store;
+use campus_auth::{auth, autostart, common, net, selfsvc};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -15,7 +10,7 @@ use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, GetStockObject, GetSysColorBrush, InvalidateRect, SetBkColor,
+    CreateFontW, GetStockObject, GetSysColorBrush, InvalidateRect, RedrawWindow, SetBkColor,
     SetBkMode, SetTextColor, UpdateWindow, WHITE_BRUSH,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -28,8 +23,8 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{LoadCursorW, IDC_ARROW};
 
-use crate::net::Adapter;
-use crate::store::Store;
+use campus_auth::net::Adapter;
+use campus_auth::store::Store;
 
 // ---------------------------------------------------------------------------
 // 控件 ID
@@ -53,13 +48,23 @@ const IDC_ED_LOG: u32 = 116;
 const IDC_BTN_OFFLINE: u32 = 117;
 const IDC_ED_PORTAL: u32 = 118;
 const IDC_BTN_DETECT: u32 = 119;
-const IDC_BTN_SLOTHELP: u32 = 120;
-const IDC_BTN_REPO: u32 = 121;
 const IDC_LBL_DISCLAIMER: u32 = 122;
+/// 开机自启并自动认证 复选框
+const IDC_CHK_AUTOSTART: u32 = 120;
+/// 掉线自动重连 复选框
+const IDC_CHK_REAUTH: u32 = 121;
+/// 自动重连: 重试间隔(秒) 输入框
+const IDC_ED_INTERVAL: u32 = 123;
+/// 自动重连: 重试次数 输入框
+const IDC_ED_RETRIES: u32 = 124;
+/// 掉线/重连统计标签
+const IDC_LBL_STATS: u32 = 125;
+/// 自动认证分组内的说明文字
+const IDC_LBL_AUTOHINT: u32 = 126;
 /// 给 Edit 设置灰色占位提示(windows-sys 未导出该常量)
 const EM_SETCUEBANNER: u32 = 0x1501;
-
-// 下线验证码对话框控件 ID
+/// Edit 通知: 内容变化
+const EN_CHANGE: u32 = 0x0300;
 
 // 样式常量(SDK 值,统一 u32; crate 内同名常量是 i32,本地定义遮蔽保证类型一致)
 const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
@@ -76,6 +81,8 @@ const ES_AUTOVSCROLL: u32 = 0x0000_0040;
 const ES_MULTILINE: u32 = 0x0000_0004;
 const ES_READONLY: u32 = 0x0000_0800;
 const ES_PASSWORD: u32 = 0x0000_0020;
+/// Edit 只允许输入数字
+const ES_NUMBER: u32 = 0x0000_2000;
 const WS_GROUP: u32 = 0x0002_0000;
 const EM_SETSEL: u32 = 0x00B1;
 const EM_REPLACESEL: u32 = 0x00C2;
@@ -95,6 +102,12 @@ enum UiMsg {
     OfflineDone { ok: bool, detail: String },
     /// 门户探测结束(Some=门户基地址)
     PortalFound { found: Option<String> },
+    /// 请求执行一次自动认证(开机自启的等待线程发出)
+    AutoLogin { reason: String },
+    /// 只更新状态标签(不动按钮可用性)
+    Status(String),
+    /// 更新掉线/重连统计标签
+    Stats { drops: u64, reauths: u64 },
 }
 
 struct App {
@@ -104,8 +117,6 @@ struct App {
     store: Arc<Mutex<Store>>,
     adapters: Mutex<Vec<Adapter>>,
     busy: AtomicBool,
-    /// 验证码对话框「确定」后为 true: 其 WM_DESTROY 不再回滚 busy 状态
-    offline_submitting: AtomicBool,
 }
 
 impl App {
@@ -151,6 +162,8 @@ unsafe fn append_log_ctl(h: HWND, line: &str) {
     SendMessageW(h, EM_SCROLLCARET, 0, 0);
 }
 
+// Win32 控件创建辅助函数参数众多是固有形态, 逐项传参比装箱成结构体更直白
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_ctrl(
     cls: &str,
     text: &str,
@@ -203,7 +216,10 @@ fn log_line(msg: &str) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
-            build_controls(hwnd);
+            // 控件不在这里创建: 实测在 WM_CREATE(窗口尚未显示)里创建子控件时,
+            // comctl32 v6 主题复选框的首帧只会画出部分边框(表现为"刚打开显示
+            // 不全、鼠标悬停后才完整"); 改为窗口创建后、显示前由 run_gui
+            // 显式调用 build_controls(父窗口已可见, 子控件创建即正常绘制)。
             return 0;
         }
         // 灰底主题: Static 文字背景与窗口一致; 状态标签绿色; 只读日志 Edit 白底
@@ -212,7 +228,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let hctl = lparam as HWND;
             let id = GetDlgCtrlID(hctl) as u32;
             if id == IDC_LBL_STATUS {
-                SetTextColor(hdc, 0x0080_00); // 绿色 (COLORREF 0x00BBGGRR)
+                SetTextColor(hdc, 0x0000_8000); // 绿色 (COLORREF 0x00BBGGRR)
                 SetBkMode(hdc, 1 /* TRANSPARENT */);
                 return GetSysColorBrush(15) as LRESULT;
             }
@@ -258,92 +274,78 @@ unsafe fn build_controls(hwnd: HWND) {
     let mono = FONT_MONO.get().copied().unwrap_or(0);
 
     // ===== 网卡选择 =====
-    create_ctrl("BUTTON", "网卡选择", BS_GROUPBOX, 0, 16, 10, 688, 116, 0, hwnd, font);
-    create_ctrl("STATIC", "网卡:", SS_LEFT, 0, 32, 32, 66, 18, 0, hwnd, font);
+    create_ctrl("BUTTON", "网卡选择", BS_GROUPBOX, 0, 16, 10, 688, 108, 0, hwnd, font);
+    create_ctrl("STATIC", "网卡:", SS_LEFT, 0, 28, 34, 66, 18, 0, hwnd, font);
     create_ctrl(
         "COMBOBOX",
         "",
         CBS_DROPDOWNLIST | WS_TABSTOP,
         WS_EX_CLIENTEDGE,
-        104,
+        96,
         30,
-        440,
+        470,
         240,
         IDC_ADAPTER,
         hwnd,
         font,
     );
-    create_ctrl("BUTTON", "刷新", BS_PUSHBUTTON | WS_TABSTOP, 0, 556, 29, 120, 26, IDC_BTN_REFRESH, hwnd, font);
+    create_ctrl("BUTTON", "刷新", BS_PUSHBUTTON | WS_TABSTOP, 0, 576, 29, 112, 26, IDC_BTN_REFRESH, hwnd, font);
     create_ctrl(
         "STATIC",
         "正在加载网卡信息...",
         SS_LEFT,
         0,
-        104,
-        66,
-        560,
-        52,
+        96,
+        62,
+        592,
+        48,
         IDC_INFO,
         hwnd,
         font,
     );
 
-    // ===== 账号与认证方式(账号/密码竖排,登录按钮在密码框右侧) =====
-    create_ctrl("BUTTON", "账号与认证方式", BS_GROUPBOX, 0, 16, 136, 688, 158, 0, hwnd, font);
-    create_ctrl("STATIC", "账号:", SS_LEFT, 0, 32, 164, 66, 18, 0, hwnd, font);
+    // ===== 账号与认证(账号/密码竖排, 右侧一键登录) =====
+    create_ctrl("BUTTON", "账号与认证", BS_GROUPBOX, 0, 16, 124, 688, 150, 0, hwnd, font);
+    create_ctrl("STATIC", "账号:", SS_LEFT, 0, 28, 150, 66, 18, 0, hwnd, font);
     create_ctrl(
         "EDIT",
         "",
         ES_LEFT | ES_AUTOHSCROLL | WS_TABSTOP,
         WS_EX_CLIENTEDGE,
-        104,
-        162,
-        456,
+        96,
+        148,
+        440,
         26,
         IDC_ED_USER,
         hwnd,
         font,
     );
-    create_ctrl("STATIC", "密码:", SS_LEFT, 0, 32, 200, 66, 18, 0, hwnd, font);
+    create_ctrl("STATIC", "密码:", SS_LEFT, 0, 28, 182, 66, 18, 0, hwnd, font);
     create_ctrl(
         "EDIT",
         "",
         ES_LEFT | ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP,
         WS_EX_CLIENTEDGE,
-        104,
-        198,
-        456,
+        96,
+        180,
+        440,
         26,
         IDC_ED_PASS,
         hwnd,
         font,
     );
-    // 登录按钮上移, 与账号/密码两行等高(右列一个整块, 给下面的门户地址行让出空间)
-    create_ctrl("BUTTON", "一键认证登录", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 572, 162, 112, 64, IDC_BTN_LOGIN, hwnd, font);
+    create_ctrl("BUTTON", "显示", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 300, 245, 52, 22, IDC_CHK_SHOW, hwnd, font);
+    // 主按钮: 与账号/密码两行等高, 右列一整块(与下方「检测门户」同宽对齐)
+    create_ctrl("BUTTON", "一键认证登录", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 544, 148, 148, 58, IDC_BTN_LOGIN, hwnd, font);
 
-    create_ctrl(
-        "BUTTON",
-        "保存账号密码(加密存储)",
-        BS_AUTOCHECKBOX | WS_TABSTOP,
-        0,
-        104,
-        236,
-        190,
-        20,
-        IDC_CHK_SAVE,
-        hwnd,
-        font,
-    );
-    create_ctrl("BUTTON", "显示", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 312, 236, 60, 20, IDC_CHK_SHOW, hwnd, font);
-    // 门户地址: 留空 = 靠 302 劫持自动发现; 检测不到时可点右侧按钮看手动获取步骤
-    create_ctrl("STATIC", "门户地址:", SS_LEFT, 0, 32, 264, 66, 18, 0, hwnd, font);
+    create_ctrl("STATIC", "门户地址:", SS_LEFT, 0, 28, 214, 66, 18, 0, hwnd, font);
     let ed_portal = create_ctrl(
         "EDIT",
         "",
         ES_LEFT | ES_AUTOHSCROLL | WS_TABSTOP,
         WS_EX_CLIENTEDGE,
-        104,
-        260,
+        96,
+        212,
         440,
         26,
         IDC_ED_PORTAL,
@@ -352,19 +354,92 @@ unsafe fn build_controls(hwnd: HWND) {
     );
     // 占位提示(灰字), 不占实际内容
     {
-        let cue = utf16("留空=自动检测（检测不到时点右侧「检测门户」看手动获取步骤）");
+        let cue = utf16("留空=自动检测");
         SendMessageW(ed_portal, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
     }
-    create_ctrl("BUTTON", "检测门户", BS_PUSHBUTTON | WS_TABSTOP, 0, 552, 259, 132, 28, IDC_BTN_DETECT, hwnd, font);
+    create_ctrl("BUTTON", "检测门户", BS_PUSHBUTTON | WS_TABSTOP, 0, 544, 211, 148, 28, IDC_BTN_DETECT, hwnd, font);
+    create_ctrl(
+        "BUTTON",
+        "保存账号密码(加密存储)",
+        BS_AUTOCHECKBOX | WS_TABSTOP,
+        0,
+        96,
+        245,
+        210,
+        22,
+        IDC_CHK_SAVE,
+        hwnd,
+        font,
+    );
 
-    create_ctrl("STATIC", "设备类型:", SS_LEFT, 0, 388, 236, 66, 18, 0, hwnd, font);
+    // ===== 自动认证(开机自启 / 掉线重连) =====
+    create_ctrl("BUTTON", "自动认证(开机自启 / 掉线重连)", BS_GROUPBOX, 0, 16, 290, 688, 76, 0, hwnd, font);
+    create_ctrl("BUTTON", "开机自启并自动认证", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 28, 312, 190, 22, IDC_CHK_AUTOSTART, hwnd, font);
+    create_ctrl("BUTTON", "掉线自动重连", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 228, 312, 130, 22, IDC_CHK_REAUTH, hwnd, font);
+    create_ctrl("STATIC", "间隔", SS_LEFT, 0, 372, 314, 40, 18, 0, hwnd, font);
+    create_ctrl(
+        "EDIT",
+        "",
+        ES_LEFT | ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP,
+        WS_EX_CLIENTEDGE,
+        414,
+        309,
+        52,
+        24,
+        IDC_ED_INTERVAL,
+        hwnd,
+        font,
+    );
+    create_ctrl("STATIC", "秒", SS_LEFT, 0, 470, 314, 20, 18, 0, hwnd, font);
+    create_ctrl("STATIC", "次数", SS_LEFT, 0, 496, 314, 40, 18, 0, hwnd, font);
+    create_ctrl(
+        "EDIT",
+        "",
+        ES_LEFT | ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP,
+        WS_EX_CLIENTEDGE,
+        538,
+        309,
+        52,
+        24,
+        IDC_ED_RETRIES,
+        hwnd,
+        font,
+    );
+    create_ctrl(
+        "STATIC",
+        "掉线 0 次 · 重连 0 次",
+        SS_LEFT,
+        0,
+        28,
+        340,
+        250,
+        18,
+        IDC_LBL_STATS,
+        hwnd,
+        font,
+    );
+    create_ctrl(
+        "STATIC",
+        "开机自启需先保存账号密码; 掉线后立即重试 1 次, 之后按间隔重试",
+        SS_LEFT,
+        0,
+        290,
+        340,
+        390,
+        18,
+        IDC_LBL_AUTOHINT,
+        hwnd,
+        font,
+    );
+
+    // ===== 设备类型(一行, 不套分组框) =====
     create_ctrl(
         "BUTTON",
         "电脑端",
         BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
         0,
-        456,
-        234,
+        96,
+        378,
         76,
         20,
         IDC_RB_PC,
@@ -376,8 +451,8 @@ unsafe fn build_controls(hwnd: HWND) {
         "手机端",
         BS_AUTORADIOBUTTON | WS_TABSTOP,
         0,
-        540,
-        234,
+        184,
+        378,
         76,
         20,
         IDC_RB_MOBILE,
@@ -392,18 +467,30 @@ unsafe fn build_controls(hwnd: HWND) {
         BST_CHECKED as usize,
         0,
     );
-    // 设备槽位说明改为「提示」按钮弹窗(原来这行静态文字会被下面的门户地址行压住)
-    create_ctrl("BUTTON", "提示", BS_PUSHBUTTON | WS_TABSTOP, 0, 624, 232, 68, 22, IDC_BTN_SLOTHELP, hwnd, font);
+    create_ctrl("STATIC", "设备类型:", SS_LEFT, 0, 28, 380, 66, 18, 0, hwnd, font);
+    create_ctrl(
+        "STATIC",
+        "账号限 1 台电脑 + 1 台手机同时在线; 换设备类型请先「下线本设备」",
+        SS_LEFT,
+        0,
+        280,
+        380,
+        420,
+        18,
+        0,
+        hwnd,
+        font,
+    );
 
-    // ===== 操作按钮行(6 键等宽) =====
-    create_ctrl("BUTTON", "联通测试", BS_PUSHBUTTON | WS_TABSTOP, 0, 24, 306, 100, 30, IDC_BTN_TEST, hwnd, font);
-    create_ctrl("BUTTON", "下线本设备", BS_PUSHBUTTON | WS_TABSTOP, 0, 136, 306, 100, 30, IDC_BTN_OFFLINE, hwnd, font);
-    create_ctrl("BUTTON", "历史日志", BS_PUSHBUTTON | WS_TABSTOP, 0, 248, 306, 100, 30, IDC_BTN_HISTORY, hwnd, font);
-    create_ctrl("BUTTON", "清除已保存", BS_PUSHBUTTON | WS_TABSTOP, 0, 360, 306, 100, 30, IDC_BTN_CLEAR, hwnd, font);
-    create_ctrl("BUTTON", "自助管理", BS_PUSHBUTTON | WS_TABSTOP, 0, 472, 306, 100, 30, IDC_BTN_SELF, hwnd, font);
-    create_ctrl("BUTTON", "GitHub 仓库", BS_PUSHBUTTON | WS_TABSTOP, 0, 584, 306, 100, 30, IDC_BTN_REPO, hwnd, font);
+    // ===== 操作按钮行(不套分组框, 避免按钮压住分组框标题) =====
+    create_ctrl("BUTTON", "联通测试", BS_PUSHBUTTON | WS_TABSTOP, 0, 28, 410, 124, 32, IDC_BTN_TEST, hwnd, font);
+    create_ctrl("BUTTON", "下线本设备", BS_PUSHBUTTON | WS_TABSTOP, 0, 162, 410, 124, 32, IDC_BTN_OFFLINE, hwnd, font);
+    create_ctrl("BUTTON", "自助管理", BS_PUSHBUTTON | WS_TABSTOP, 0, 296, 410, 124, 32, IDC_BTN_SELF, hwnd, font);
+    create_ctrl("BUTTON", "清除已保存", BS_PUSHBUTTON | WS_TABSTOP, 0, 430, 410, 124, 32, IDC_BTN_CLEAR, hwnd, font);
+    create_ctrl("BUTTON", "历史日志", BS_PUSHBUTTON | WS_TABSTOP, 0, 564, 410, 124, 32, IDC_BTN_HISTORY, hwnd, font);
+
     // 状态行(按钮行下方独立一行)
-    create_ctrl("STATIC", "状态: 就绪", SS_LEFT, 0, 16, 346, 400, 18, IDC_LBL_STATUS, hwnd, font);
+    create_ctrl("STATIC", "状态: 就绪", SS_LEFT, 0, 16, 452, 400, 18, IDC_LBL_STATUS, hwnd, font);
 
     // ===== 日志区 =====
     let ed_log = create_ctrl(
@@ -411,10 +498,10 @@ unsafe fn build_controls(hwnd: HWND) {
         "",
         ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | ES_LEFT | WS_TABSTOP,
         WS_EX_CLIENTEDGE,
-        28,
-        374,
-        664,
-        296,
+        16,
+        476,
+        688,
+        288,
         IDC_ED_LOG,
         hwnd,
         mono,
@@ -425,11 +512,11 @@ unsafe fn build_controls(hwnd: HWND) {
     // ===== 免责声明(窗口底部常显) =====
     create_ctrl(
         "STATIC",
-        crate::common::DISCLAIMER,
+        common::DISCLAIMER,
         SS_LEFT,
         0,
         16,
-        676,
+        772,
         688,
         18,
         IDC_LBL_DISCLAIMER,
@@ -470,6 +557,10 @@ unsafe fn handle_command(hwnd: HWND, id: u32, code: u32) {
             let new_state = if was_checked { 0usize } else { BST_CHECKED as usize };
             SendMessageW(chk, BM_SETCHECK, new_state, 0);
         }
+        (IDC_CHK_AUTOSTART, _) => on_toggle_autostart(hwnd),
+        (IDC_CHK_REAUTH, _) => on_toggle_reauth(hwnd),
+        (IDC_ED_INTERVAL, EN_CHANGE) => on_reauth_params_changed(),
+        (IDC_ED_RETRIES, EN_CHANGE) => on_reauth_params_changed(),
         // 设备类型 radio 同样存在不自翻问题: 点击后由程序主动置位(SETCHECK 为绝对设置, 幂等)
         (IDC_RB_PC, _) => {
             SendMessageW(GetDlgItem(hwnd, IDC_RB_PC as i32), BM_SETCHECK, BST_CHECKED as usize, 0);
@@ -482,8 +573,6 @@ unsafe fn handle_command(hwnd: HWND, id: u32, code: u32) {
         (IDC_BTN_TEST, _) => on_connectivity_test(),
         (IDC_BTN_OFFLINE, _) => on_offline(),
         (IDC_BTN_DETECT, _) => on_detect_portal(),
-        (IDC_BTN_SLOTHELP, _) => on_slot_help(),
-        (IDC_BTN_REPO, _) => on_open_repo(),
         (IDC_BTN_LOGIN, _) => on_login(),
         (IDC_BTN_HISTORY, _) => open_history_window(),
         (IDC_BTN_CLEAR, _) => on_clear_saved(),
@@ -492,7 +581,7 @@ unsafe fn handle_command(hwnd: HWND, id: u32, code: u32) {
                 .get()
                 .and_then(|a| a.store.lock().ok().map(|s| s.data.portal_url.clone()))
                 .unwrap_or_default();
-            let url = utf16(&crate::common::self_service_url(&base));
+            let url = utf16(&common::self_service_url(&base));
             let op = utf16("open");
             ShellExecuteW(
                 hwnd,
@@ -500,7 +589,7 @@ unsafe fn handle_command(hwnd: HWND, id: u32, code: u32) {
                 url.as_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                SW_SHOWNORMAL as i32,
+                SW_SHOWNORMAL,
             );
         }
         _ => {}
@@ -669,7 +758,7 @@ unsafe fn collect_params() -> Option<TaskParams> {
         pass,
         ua_kind,
         source,
-        mac_nosep: crate::selfsvc::norm_mac(&adapter.mac),
+        mac_nosep: selfsvc::norm_mac(&adapter.mac),
         acip,
         acname,
         adapter_name: adapter.name,
@@ -780,6 +869,11 @@ unsafe fn on_login() {
         if params.save { "是" } else { "否" }
     ));
     let tx = app.tx.lock().unwrap().clone();
+    spawn_login(params, tx);
+}
+
+/// 后台登录线程(手动认证 / 开机自动认证 / 掉线重连共用)
+fn spawn_login(params: TaskParams, tx: Sender<UiMsg>) {
     thread::spawn(move || {
         let tx_log = Mutex::new(tx.clone());
         let log_fn = move |s: &str| {
@@ -790,11 +884,7 @@ unsafe fn on_login() {
         a.set_portal_ac(&params.acip, &params.acname);
         let (ok, code, detail) = a.login(&params.user, &params.pass);
         // 自动发现的成果写回数据文件(只存 scheme://host, 不含会过期的会话参数)
-        let discovered = a
-            .discovered_base
-            .lock()
-            .ok()
-            .and_then(|g| g.clone());
+        let discovered = a.discovered_base.lock().ok().and_then(|g| g.clone());
         if let Some(app) = APP.get() {
             if let Ok(mut store) = app.store.lock() {
                 let pw = if params.save { Some(params.pass.as_str()) } else { None };
@@ -822,37 +912,349 @@ unsafe fn on_login() {
     });
 }
 
-/// 打开项目主页(GitHub 仓库)
-unsafe fn on_open_repo() {
-    let Some(app) = APP.get() else { return };
-    let url = utf16(crate::common::REPO_URL);
-    let op = utf16("open");
-    ShellExecuteW(
-        app.hwnd(),
-        op.as_ptr(),
-        url.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-        1, /* SW_SHOWNORMAL */
-    );
-    log_line(&format!("已打开项目主页: {}", crate::common::REPO_URL));
+// ---------------------------------------------------------------------------
+// 开机自启 / 掉线自动重连
+// ---------------------------------------------------------------------------
+
+/// 只更新状态标签(不碰按钮可用性; 供后台线程经消息队列调用)
+unsafe fn set_status(text: &str) {
+    if let Some(app) = APP.get() {
+        set_text(
+            GetDlgItem(app.hwnd(), IDC_LBL_STATUS as i32),
+            &format!("状态: {text}"),
+        );
+    }
 }
 
-/// 设备槽位说明(原来放在界面上的静态提示, 位置被门户地址行占用后改为弹窗)
-unsafe fn on_slot_help() {
+/// 按网卡名取当前 IPv4(取不到时退而找校园网段网卡)。
+/// 自动认证不走界面, 每次现取, 适配开机初期网卡尚未就绪 / IP 变化。
+fn resolve_source_ip(adapter_name: &str) -> Option<std::net::Ipv4Addr> {
+    let adapters = net::list_adapters();
+    if !adapter_name.is_empty() {
+        if let Some(a) = adapters.iter().find(|a| a.name == adapter_name) {
+            if let Some(ip) = a.ipv4.first() {
+                return Some(*ip);
+            }
+        }
+    }
+    adapters
+        .iter()
+        .find(|a| a.is_campus())
+        .and_then(|a| a.ipv4.first().copied())
+}
+
+/// 从数据文件构造自动认证参数(不依赖界面输入框; 无已存凭据返回 None)
+unsafe fn build_auto_params() -> Option<TaskParams> {
+    let app = APP.get()?;
+    let (user, pw, ua_kind, adapter_name, portal, acip, acname) = {
+        let s = app.store.lock().ok()?;
+        if !s.has_usable_credentials() {
+            return None;
+        }
+        (
+            s.data.username.clone(),
+            s.get_password()?,
+            s.data.ua.clone(),
+            s.data.adapter.clone(),
+            s.data.portal_url.clone(),
+            s.data.wlanacip.clone(),
+            s.data.wlanacname.clone(),
+        )
+    };
+    // 网卡: 按保存的名字找, 找不到退而找校园网段网卡
+    let adapters = net::list_adapters();
+    let ad = adapters
+        .iter()
+        .find(|a| !adapter_name.is_empty() && a.name == adapter_name)
+        .or_else(|| adapters.iter().find(|a| a.is_campus()))?;
+    Some(TaskParams {
+        user,
+        pass: pw,
+        ua_kind,
+        source: ad.ipv4.first().copied(),
+        adapter_name: ad.name.clone(),
+        save: true, // 自动认证照原样回写, 不清凭据
+        portal,
+        mac_nosep: selfsvc::norm_mac(&ad.mac),
+        acip,
+        acname,
+    })
+}
+
+/// 自动认证(开机自启用): 用已保存凭据, 不弹确认框
+unsafe fn auto_login(reason: &str) {
     let Some(app) = APP.get() else { return };
-    let text = utf16(
-        "请选择要占用的设备槽位, 每个校园网账号同时只能占 1 个电脑槽 + 1 个手机槽:\n\
-         \x20   · 选「电脑端」→ 认证后占用电脑槽\n\
-         \x20   · 选「手机端」→ 认证后占用手机槽\n\n\
-         槽位由门户按认证时的 User-Agent 判定, 并且建立 MAC 绑定后有粘性:\n\
-         想换设备类型时, 建议先点「下线本设备」(会同时清除 MAC 绑定),\n\
-         否则重新认证可能仍被识别为原来的槽位。\n\n\
-         同类型重复登录会被判为「槽位冲突」—— 本程序不会自动顶号,\n\
-         只会提示你到自助管理界面手动下线占用设备。",
+    if app.busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(params) = build_auto_params() else {
+        app.busy.store(false, Ordering::SeqCst);
+        log_line(&format!("{reason}: 没有可用的已保存凭据或网卡, 跳过"));
+        return;
+    };
+    let device = if params.ua_kind == "mobile" { "手机端" } else { "电脑端" };
+    set_busy(true, "自动认证中...");
+    log_line(&format!(
+        "---- {reason}: 账号={} 网卡={} 设备={} ----",
+        params.user, params.adapter_name, device
+    ));
+    let tx = app.tx.lock().unwrap().clone();
+    spawn_login(params, tx);
+}
+
+/// 「开机自启并自动认证」复选框: 写/删注册表 Run 项
+unsafe fn on_toggle_autostart(hwnd: HWND) {
+    let Some(app) = APP.get() else { return };
+    let chk = GetDlgItem(hwnd, IDC_CHK_AUTOSTART as i32);
+    let was_checked = SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+    let new_checked = !was_checked;
+    if new_checked {
+        // 开机自动认证依赖已保存凭据; 没有就拒绝开启并提示
+        let has_creds = app
+            .store
+            .lock()
+            .map(|s| s.has_usable_credentials())
+            .unwrap_or(false);
+        if !has_creds {
+            messagebox_warn(
+                hwnd,
+                "开机自动认证需要已保存的账号密码:\n请先勾选「保存账号密码」并完成一次登录, 再来开启。",
+            );
+            return; // 保持未勾选
+        }
+    }
+    SendMessageW(
+        chk,
+        BM_SETCHECK,
+        if new_checked { BST_CHECKED as usize } else { 0 },
+        0,
     );
-    let cap = utf16("设备槽位说明");
-    MessageBoxW(app.hwnd(), text.as_ptr(), cap.as_ptr(), MB_ICONINFORMATION);
+    match autostart::set_enabled(new_checked) {
+        Ok(()) => {
+            if let Ok(mut s) = app.store.lock() {
+                s.data.auto_start = new_checked;
+                s.save();
+            }
+            if new_checked {
+                log_line("已开启开机自启: 重启后用保存的账号自动认证(最小化启动)");
+            } else {
+                log_line("已关闭开机自启(注册表启动项已删除)");
+            }
+        }
+        Err(e) => {
+            // 注册表写失败: 还原勾选与配置, 不让界面说谎
+            SendMessageW(
+                chk,
+                BM_SETCHECK,
+                if was_checked { BST_CHECKED as usize } else { 0 },
+                0,
+            );
+            log_line(&format!("开机自启设置失败: {e}"));
+            messagebox_warn(hwnd, &format!("开机自启设置失败:\n{e}"));
+        }
+    }
+}
+
+/// 「掉线自动重连」复选框
+unsafe fn on_toggle_reauth(hwnd: HWND) {
+    let Some(app) = APP.get() else { return };
+    let chk = GetDlgItem(hwnd, IDC_CHK_REAUTH as i32);
+    let was_checked = SendMessageW(chk, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+    let new_checked = !was_checked;
+    if new_checked {
+        let has_creds = app
+            .store
+            .lock()
+            .map(|s| s.has_usable_credentials())
+            .unwrap_or(false);
+        if !has_creds {
+            messagebox_warn(
+                hwnd,
+                "掉线自动重连需要已保存的账号密码:\n请先勾选「保存账号密码」并完成一次登录, 再来开启。",
+            );
+            return;
+        }
+    }
+    SendMessageW(
+        chk,
+        BM_SETCHECK,
+        if new_checked { BST_CHECKED as usize } else { 0 },
+        0,
+    );
+    if let Ok(mut s) = app.store.lock() {
+        s.data.auto_reauth = new_checked;
+        s.save();
+    }
+    log_line(if new_checked {
+        "已开启掉线自动重连"
+    } else {
+        "已关闭掉线自动重连"
+    });
+}
+
+/// 重试间隔/次数输入框变化: 合法才落库(输入中途不抢)
+unsafe fn on_reauth_params_changed() {
+    let Some(app) = APP.get() else { return };
+    let interval = get_text(GetDlgItem(app.hwnd(), IDC_ED_INTERVAL as i32))
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|v| (5..=3600).contains(v));
+    let retries = get_text(GetDlgItem(app.hwnd(), IDC_ED_RETRIES as i32))
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|v| (1..=20).contains(v));
+    if interval.is_none() && retries.is_none() {
+        return;
+    }
+    if let Ok(mut s) = app.store.lock() {
+        if let Some(v) = interval {
+            s.data.reauth_interval_secs = v;
+        }
+        if let Some(v) = retries {
+            s.data.reauth_max_retries = v;
+        }
+        s.save();
+    }
+}
+
+/// 自动重连配置快照(每轮从 store 现取, 界面改设置即时生效)
+struct ReauthCfg {
+    enabled: bool,
+    interval: u32,
+    retries: u32,
+    user: String,
+    pass: Option<String>,
+    ua_kind: String,
+    adapter: String,
+    portal: String,
+    acip: String,
+    acname: String,
+}
+
+/// 用快照配置直接跑一次登录(不经过界面)
+fn reauth_login_once(
+    cfg: &ReauthCfg,
+    log: &(dyn Fn(&str) + Sync),
+) -> (bool, &'static str, String) {
+    let mut a = auth::Auth::new(&cfg.ua_kind, resolve_source_ip(&cfg.adapter), log);
+    a.set_portal_url(Some(cfg.portal.clone()));
+    a.set_portal_ac(&cfg.acip, &cfg.acname);
+    let pass = cfg.pass.as_deref().unwrap_or("");
+    a.login(&cfg.user, pass)
+}
+
+/// 掉线自动重连监控线程: 每 5 秒探测一次。
+/// 只有「在线 -> 未认证」的跳变才算掉线(开机就没认证上不算, 避免误报);
+/// 掉线后立即重试 1 次, 失败按间隔重试, 合计 reauth_max_retries 次。
+unsafe fn spawn_reauth_monitor() {
+    thread::spawn(move || {
+        let mut was_online: Option<bool> = None;
+        loop {
+            thread::sleep(std::time::Duration::from_secs(5));
+            let Some(app) = APP.get() else { continue };
+            let cfg = {
+                let Ok(s) = app.store.lock() else { continue };
+                ReauthCfg {
+                    enabled: s.data.auto_reauth,
+                    interval: s.data.reauth_interval_secs.clamp(5, 3600),
+                    retries: s.data.reauth_max_retries.clamp(1, 20),
+                    user: s.data.username.clone(),
+                    pass: if s.data.save_password { s.get_password() } else { None },
+                    ua_kind: s.data.ua.clone(),
+                    adapter: s.data.adapter.clone(),
+                    portal: s.data.portal_url.clone(),
+                    acip: s.data.wlanacip.clone(),
+                    acname: s.data.wlanacname.clone(),
+                }
+            };
+            if !cfg.enabled || cfg.user.is_empty() || cfg.pass.is_none() {
+                was_online = None; // 关闭/缺凭据时重置观察状态
+                continue;
+            }
+            if app.busy.load(Ordering::SeqCst) {
+                continue; // 用户正在手动操作, 本轮让位
+            }
+            let tx = app.tx.lock().unwrap().clone();
+            let tx_log = Mutex::new(tx.clone());
+            let log_fn = move |s: &str| {
+                let _ = tx_log.lock().unwrap().send(UiMsg::Log(s.to_string()));
+            };
+            // 探测用静默日志(每 5 秒一轮, 细节写进日志会刷屏)
+            let quiet = |_s: &str| {};
+            let a = auth::Auth::new(&cfg.ua_kind, resolve_source_ip(&cfg.adapter), &quiet);
+            let (conclusive, _) = a.connectivity_test();
+            match conclusive {
+                Some(true) => was_online = Some(true),
+                Some(false) => {
+                    if was_online != Some(true) {
+                        // 从未在线过(开机就没认证上): 不算掉线, 只记录状态
+                        was_online = Some(false);
+                        continue;
+                    }
+                    was_online = Some(false);
+                    // ---- 掉线! ----
+                    let mut drops_now: u64 = 0;
+                    if let Ok(mut s) = app.store.lock() {
+                        s.data.drop_count += 1;
+                        s.save();
+                        drops_now = s.data.drop_count;
+                        let _ = tx.send(UiMsg::Stats {
+                            drops: s.data.drop_count,
+                            reauths: s.data.reauth_count,
+                        });
+                    }
+                    let _ = tx.send(UiMsg::Status("检测到掉线, 自动重连中...".into()));
+                    let _ = tx.send(UiMsg::Log(format!(
+                        "---- 自动重连: 检测到掉线(累计第 {drops_now} 次), 立即重试认证 ----"
+                    )));
+                    let mut success = false;
+                    for attempt in 1..=cfg.retries {
+                        if attempt > 1 {
+                            let _ = tx.send(UiMsg::Log(format!(
+                                "自动重连: 等待 {} 秒后进行第 {attempt}/{} 次尝试",
+                                cfg.interval, cfg.retries
+                            )));
+                            thread::sleep(std::time::Duration::from_secs(cfg.interval as u64));
+                        }
+                        if app.busy.load(Ordering::SeqCst) {
+                            let _ = tx.send(UiMsg::Log("自动重连让位: 用户正在手动操作".into()));
+                            break;
+                        }
+                        let (ok, code, detail) = reauth_login_once(&cfg, &log_fn);
+                        if let Ok(mut s) = app.store.lock() {
+                            s.data.reauth_count += 1;
+                            s.save();
+                            let _ = tx.send(UiMsg::Stats {
+                                drops: s.data.drop_count,
+                                reauths: s.data.reauth_count,
+                            });
+                        }
+                        if ok {
+                            let _ = tx.send(UiMsg::Log("自动重连成功, 已恢复上线".into()));
+                            let _ = tx.send(UiMsg::Status("自动重连成功".into()));
+                            was_online = Some(true);
+                            success = true;
+                            break;
+                        }
+                        let _ = tx.send(UiMsg::Log(format!(
+                            "自动重连第 {attempt}/{} 次失败({code}): {detail}",
+                            cfg.retries
+                        )));
+                    }
+                    if !success {
+                        let _ = tx.send(UiMsg::Status("自动重连失败".into()));
+                        let _ = tx.send(UiMsg::Log(
+                            "自动重连未成功(可手动点「一键认证登录」); 恢复在线后继续监测".into(),
+                        ));
+                        was_online = None; // 重置: 避免把持续的离线状态反复计成掉线
+                    }
+                }
+                None => { /* 无结论(网卡未连接等): 不计掉线, 保持观察 */ }
+            }
+        }
+    });
 }
 
 /// 检测门户: 只做"找认证服务器"(探测劫持/验证已填地址), 不登录、不占用槽位
@@ -892,12 +1294,21 @@ unsafe fn on_clear_saved() {
     }
     if let Ok(mut store) = app.store.lock() {
         store.clear_credentials();
+        // 凭据没了, 两个自动认证开关一并关闭(开机自启的注册表项也删掉)
+        if store.data.auto_start {
+            let _ = autostart::set_enabled(false);
+            store.data.auto_start = false;
+        }
+        store.data.auto_reauth = false;
+        store.save();
     }
     // 界面上的账号密码输入框同步清空
     set_text(GetDlgItem(app.hwnd(), IDC_ED_USER as i32), "");
     set_text(GetDlgItem(app.hwnd(), IDC_ED_PASS as i32), "");
     SendMessageW(GetDlgItem(app.hwnd(), IDC_CHK_SAVE as i32), BM_SETCHECK, 0, 0);
-    log_line("已清除保存的账号密码信息");
+    SendMessageW(GetDlgItem(app.hwnd(), IDC_CHK_AUTOSTART as i32), BM_SETCHECK, 0, 0);
+    SendMessageW(GetDlgItem(app.hwnd(), IDC_CHK_REAUTH as i32), BM_SETCHECK, 0, 0);
+    log_line("已清除保存的账号密码信息(开机自启/掉线重连已一并关闭)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,7 +1451,7 @@ unsafe fn open_history_window() {
         0,
         cls.as_ptr(),
         title.as_ptr(),
-        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
         120,
         120,
         hrect.right - hrect.left,
@@ -1146,6 +1557,14 @@ unsafe fn drain_messages() {
                 app.busy.store(false, Ordering::SeqCst);
                 set_busy(false, "就绪");
             }
+            UiMsg::AutoLogin { reason } => auto_login(&reason),
+            UiMsg::Status(s) => set_status(&s),
+            UiMsg::Stats { drops, reauths } => {
+                set_text(
+                    GetDlgItem(app.hwnd(), IDC_LBL_STATS as i32),
+                    &format!("掉线 {drops} 次 · 重连 {reauths} 次"),
+                );
+            }
             UiMsg::LoginDone { ok, code, detail } => {
                 app.busy.store(false, Ordering::SeqCst);
                 match (ok, code) {
@@ -1165,7 +1584,7 @@ unsafe fn drain_messages() {
                         set_busy(false, "槽位冲突");
                         let text = utf16(&format!(
                             "该设备槽位已被占用(或在线终端数超限).\n\n请打开自助管理界面手动下线占用设备后重试:\n{}\n\n(点击「自助管理」按钮可直达; 「下线本设备」可下线本机并清绑定)",
-                            crate::common::self_service_url(
+                            common::self_service_url(
                                 &APP.get()
                                     .and_then(|a| a.store.lock().ok().map(|s| s.data.portal_url.clone()))
                                     .unwrap_or_default()
@@ -1233,7 +1652,6 @@ unsafe fn drain_messages() {
                 }
             }
             UiMsg::OfflineDone { ok, detail } => {
-                app.offline_submitting.store(false, Ordering::SeqCst);
                 app.busy.store(false, Ordering::SeqCst);
                 if ok {
                     set_busy(false, "已下线");
@@ -1324,15 +1742,17 @@ unsafe fn run_gui() {
     RegisterClassW(&wc2);
 
     let title: Vec<u16> = "贺州学院校园网认证".encode_utf16().chain([0]).collect();
-    // 客户区 720x706
-    let mut rect = RECT { left: 0, top: 0, right: dp(720), bottom: dp(704) };
+    // 客户区 720x800(比旧布局高 88: 新增「自动认证」分组)
+    let mut rect = RECT { left: 0, top: 0, right: dp(720), bottom: dp(800) };
     AdjustWindowRect(&mut rect, WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, 0);
 
     let hwnd = CreateWindowExW(
         0,
         class_name.as_ptr(),
         title.as_ptr(),
-        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        // WS_VISIBLE: 创建即可见 —— 之后紧接着创建的控件走"父窗口已可见"路径,
+        // 主题复选框首帧绘制才完整(见 WM_CREATE 注释)
+        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN | WS_VISIBLE,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         rect.right - rect.left,
@@ -1350,8 +1770,9 @@ unsafe fn run_gui() {
         store,
         adapters: Mutex::new(Vec::new()),
         busy: AtomicBool::new(false),
-        offline_submitting: AtomicBool::new(false),
     });
+    // 窗口已创建(且已 WS_VISIBLE)后再建控件: 避免 WM_CREATE 时序下主题复选框首帧残缺
+    build_controls(hwnd);
     let app = APP.get().unwrap();
 
     // 恢复已保存的账号信息
@@ -1401,7 +1822,102 @@ unsafe fn run_gui() {
 
     refresh_adapters(false);
 
-    ShowWindow(hwnd, SW_SHOW);
+    // ---- 恢复「自动认证」设置 ----
+    let (auto_start, auto_reauth, interval, retries, drops, reauths) = {
+        let s = app.store.lock().unwrap();
+        (
+            s.data.auto_start,
+            s.data.auto_reauth,
+            s.data.reauth_interval_secs,
+            s.data.reauth_max_retries,
+            s.data.drop_count,
+            s.data.reauth_count,
+        )
+    };
+    set_text(GetDlgItem(hwnd, IDC_ED_INTERVAL as i32), &interval.to_string());
+    set_text(GetDlgItem(hwnd, IDC_ED_RETRIES as i32), &retries.to_string());
+    set_text(
+        GetDlgItem(hwnd, IDC_LBL_STATS as i32),
+        &format!("掉线 {drops} 次 · 重连 {reauths} 次"),
+    );
+    if auto_reauth {
+        SendMessageW(GetDlgItem(hwnd, IDC_CHK_REAUTH as i32), BM_SETCHECK, BST_CHECKED as usize, 0);
+    }
+    // 开机自启以注册表实际状态为准(dat 可能从别的机器拷来);
+    // 已开启则顺带自愈: 把入口命令改指向当前 exe
+    let reg_enabled = autostart::sync_if_enabled();
+    if reg_enabled != auto_start {
+        if let Ok(mut s) = app.store.lock() {
+            s.data.auto_start = reg_enabled;
+            s.save();
+        }
+        log_line(if reg_enabled {
+            "检测到开机自启注册表项已开启(与数据文件不一致, 已同步)"
+        } else {
+            "开机自启注册表项不存在, 已同步关闭数据文件里的开关"
+        });
+    }
+    if reg_enabled {
+        SendMessageW(GetDlgItem(hwnd, IDC_CHK_AUTOSTART as i32), BM_SETCHECK, BST_CHECKED as usize, 0);
+    }
+
+    // 掉线自动重连监控(常驻线程; 开关/参数以 store 为准, 界面改动即时生效)
+    spawn_reauth_monitor();
+
+    // ---- 开机自启启动(--auto): 最小化 + 等网络就绪后自动认证 ----
+    let auto_flag = std::env::args().any(|a| a == "--auto");
+    if auto_flag {
+        log_line("开机自动启动: 等待网络就绪后自动认证(窗口已最小化)");
+        let tx_auto = app.tx.lock().unwrap().clone();
+        thread::spawn(move || {
+            // 等校园网网卡拿到 IPv4(开机网卡初始化可能要几秒), 最多 90 秒
+            let mut ready = false;
+            for _ in 0..45 {
+                thread::sleep(std::time::Duration::from_secs(2));
+                if net::list_adapters().iter().any(|a| !a.ipv4.is_empty()) {
+                    ready = true;
+                    break;
+                }
+            }
+            if !ready {
+                let _ = tx_auto.send(UiMsg::Log(
+                    "开机自动认证: 等待 90 秒仍无可用网络, 放弃本次自动认证".into(),
+                ));
+                return;
+            }
+            thread::sleep(std::time::Duration::from_secs(1)); // 稳一秒让 AC/门户就绪
+            // 仅当自启开关仍开着且凭据齐全才认证(用户可能中途取消过)
+            let go = APP.get().is_some_and(|app| {
+                app.store
+                    .lock()
+                    .map(|s| s.data.auto_start && s.has_usable_credentials())
+                    .unwrap_or(false)
+            });
+            if !go {
+                let _ = tx_auto.send(UiMsg::Log(
+                    "开机自动认证: 自启已关闭或没有保存凭据, 跳过".into(),
+                ));
+                return;
+            }
+            let _ = tx_auto.send(UiMsg::AutoLogin {
+                reason: "开机自动认证".into(),
+            });
+        });
+    }
+
+    ShowWindow(hwnd, if auto_flag { SW_SHOWMINIMIZED } else { SW_SHOW });
+    // 首帧完整重绘: 主题绘制的复选框首帧可能只画出部分边框(表现为
+    // "刚打开显示不全、鼠标一放上去才完整")。用 RedrawWindow 一次性按
+    // 系统正确顺序(父窗口 + 全部子控件)重绘; 注意不能用"逐个子控件
+    // UpdateWindow"的循环, 那会按 z-order 反向把底层 groupbox 的背景
+    // 盖到复选框上, 反而制造残缺。
+    // 标志: RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+    RedrawWindow(
+        hwnd,
+        std::ptr::null(),
+        std::ptr::null_mut(),
+        0x0001 | 0x0004 | 0x0080 | 0x0100,
+    );
     SetTimer(hwnd, 1, 80, None);
 
     let mut msg: MSG = std::mem::zeroed();

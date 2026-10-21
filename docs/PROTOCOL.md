@@ -1,6 +1,11 @@
 # 认证协议文档 (bossWeb Portal)
 
 > 本文描述校园网 bossWeb 门户的 Web 认证协议，全部要点均来自实机抓包与回归验证。
+>
+> **⚠️ 2026-10 门户大改版**：学校已把门户换成新版 SPA（IP `10.255.2.252` → `10.255.2.249`，
+> 登录路径 `/webauth.do` → `/portal/webauth`，自助后台 `/self/index.html` → `/self/` SPA + `/api/portal/user/*` 令牌 API，
+> **图片验证码取消、下线改走令牌接口**）。**以 §8「新版门户（v3）」为准**；
+> 旧版协议（§1–§7）保留作历史参考，工具会按登录页是否有 password 输入框自动识别两种门户。
 
 ## 1. 探测：判断认证状态
 
@@ -76,7 +81,7 @@ scheme=http&serverIp=tomcat_server%3A80&hostIp=http%3A%2F%2F127.0.0.1%3A8081%2F
 - **编码**：门户响应以 UTF-8 为主，个别流程页为 GBK，建议 UTF-8 → GBK 顺序容错解码
 - **幂等**：已在线时只探测不提交表单，探测请求应保持轻量（单请求、短超时）
 
-## 7. 自助管理下线接口（/self，实测）
+## 7. 自助管理下线接口（/self，旧版，历史参考）
 
 下线走门户自助管理 JSON API（与 web 认证同主机 `10.255.2.252` 但**独立会话**，门户登录不贯通）。全链路：
 
@@ -93,3 +98,62 @@ scheme=http&serverIp=tomcat_server%3A80&hostIp=http%3A%2F%2F127.0.0.1%3A8081%2F
 - **清绑定注意**：`kickonline`（按行下线）**不**清除 MAC 绑定；`clearusermac.do` 虽返回「操作成功」但实测不总能实际清掉绑定（次日登录仍沿用旧分类）。修正/切换槽位请用 `kickonlineByMac`
 - **限流**：连续登录间隔 <15s 会「认证请求太频繁」，重试间隔建议 ≥30s
 - **策略**：仅下线本机（行匹配本机 MAC/IP），绝不顶号；死路：`webdisconn.do`（恒拒绝）、`appoffline.do`（404）、在线态 `1.1.1.1/userlogout.massrv`（直通公网）
+
+## 8. 新版门户（v3，2026-10 起，当前生效）
+
+门户换成 Vite 打包的 SPA + JSON/表单接口。旧版（§1–§7）仅作历史参考，判据天然兼容：**登录页没有 `password` 输入框 → 新版 SPA 门户**。
+
+### 8.1 变化一览
+
+| 项 | 旧（≤2026-09） | 新（2026-10 起） |
+|---|---|---|
+| 门户 IP | `10.255.2.252` | `10.255.2.249` |
+| 登录页路径 | `/webauth.do?<绑定query>` | `/portal/webauth?<绑定query>` |
+| 登录页内容 | 74KB 服务端渲染 HTML（带表单） | 2.2KB SPA 外壳，只有隐藏参数 `#portalLegacyParams` |
+| 提交方式 | 向同一 URL 表单 POST（B 组 9 字段 + userId/passwd） | `POST /portal/webauth/auth`（表单编码），响应 JSON |
+| 自助后台 | `/self/index.html` + `/self/*.do`（独立 SPA 登录 + 图片验证码） | `/self/` SPA + `/api/portal/user/*`（`Authorization: Bearer <令牌>`），无验证码 |
+| 令牌来源 | 自助 SPA 自己登录（tologin/login.do） | Web 认证响应 `result.token` |
+| 网关参数 | 会话参数只在校验里 | 接口必填 `wlanacip` / `wlanacname` |
+
+### 8.2 认证流程（实测）
+
+```
+1) 探测(未认证时任意 HTTP) → 302 Location:
+   http://10.255.2.249/portal/webauth?wlanacip=10.255.2.250&wlanacname=hzxy&wlanuserip=<本机IP>&mac=<本机MAC>&vlan=0&url=<原始目标>
+2) GET 该 Location → SPA 外壳; 页面无 password 输入框(这是"新版 SPA 门户"的判据)
+3) POST http://10.255.2.249/portal/webauth/auth
+   Content-Type: application/x-www-form-urlencoded
+   userId=<账号>&passwd=<密码>&loginMode=password
+   &wlanuserip=<本机IP>&wlanacip=10.255.2.250&wlanacname=hzxy
+4) 响应(JSON): {"success":true,"message":"","code":200,
+    "result":{"redirect":"/portal/center?pageid=...&terminalType=a&distoken=...&token=<签名令牌>",
+              "accountId":"<账号>","distoken":"...","token":"<签名令牌>"},
+    "timestamp":...}
+5) 放行判定: 仍用探测(等 3 秒, 200/204 无 Location = 已上线) —— 不解析 JSON 文案
+```
+
+关键细节：
+
+- **密码明文**，无 RSA/SM2/JSEncrypt；`loginMode` 可选 `password` / `sms` / `twoFactor`（本校未启用短信/二次验证）。
+- **设备已在线时接口照样返回 `success:true` + 新令牌**，提示放在 `redirect` 的 `errorMsg` 参数（`此IP已在线请勿重复认证`）——在线状态下也能拿令牌查列表/下线。
+- 失败响应：`{"success":false,"message":"账号或密码错误","code":500}`；缺少 `wlanacip`/`wlanacname` 时报「认证失败: 网关配置不存在」。
+- `token` 形如 `base64url({"accountId","timestamp"}) + "." + <hex 签名>`，实测同一令牌 10 分钟内可用。
+
+### 8.3 自助后台 API（令牌鉴权，实测）
+
+基地址 `http://10.255.2.249`，前缀 `/api`，鉴权头 `Authorization: Bearer <token>`。
+
+| 用途 | 调用 | 备注 |
+|---|---|---|
+| 在线设备 | `GET /api/portal/user/onlineUsers?pageNum=1&pageSize=50` | `result.items[]`：`accountBindIp` / `callerId`(MAC) / `terminalType`(a/b) / `terminalTypeLabel` / `onlineTime` / `internetTacticsName` |
+| 强制下线 | `POST /api/portal/user/onlineUser/forceOffline` JSON `{"accountBindIp":"<IP>","callerId":"<MAC>"}` | 实测「强制下线成功」；3~4 秒内探测回 302 |
+| 清除 MAC 绑定 | `DELETE /api/portal/user/accountMac?terminalMac=<MAC>` | 无记录时回「未找到可清除的MAC记录」（视为无需清理） |
+
+响应统一 `{success, message, code, result, timestamp}`；失败看 `message`。
+
+### 8.4 对工具的影响
+
+1. **登录**：登录页无 password 输入框 → 走 `/portal/webauth/auth`（JSON 响应），否则走旧表单式逻辑（§3）。
+2. **门户地址与网关参数要"记住"**：在线时无劫持响应，而新接口必须带 `wlanacip`/`wlanacname`，因此首次登录时把门户基地址 + 网关参数写进 `campus-auth.dat`（`portal_url` / `wlanacip` / `wlanacname`）。
+3. **下线流程**：拿令牌（Web 认证接口）→ `onlineUsers` → 按 MAC/IP 匹配本机 → `forceOffline` → `accountMac` 清绑定 → 探测复核。GUI 验证码弹窗、GDI+ PNG 解码、CLI `--offline-code/--offline-session` 全部删除。
+4. **槽位分类仍由 UA 决定**（`terminalType` a=电脑/b=手机），选「电脑端/手机端」继续有效。

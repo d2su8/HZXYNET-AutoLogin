@@ -20,5 +20,7 @@ campus_auth.json
 Thumbs.db
 .DS_Store
 
+.workbuddy/
+
 # Rust
 **/*.rs.bk

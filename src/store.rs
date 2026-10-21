@@ -4,7 +4,6 @@
 //! 与程序放在一起,不散落单独的日志/配置文件。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +38,24 @@ pub struct StoreData {
     pub wlanacip: String,
     #[serde(default)]
     pub wlanacname: String,
+    /// 开机自启: 写 HKCU Run 项, 开机带 --auto 启动即用已存凭据自动认证
+    #[serde(default)]
+    pub auto_start: bool,
+    /// 掉线自动重连: 后台定时探测, 掉线后按策略自动重认证
+    #[serde(default)]
+    pub auto_reauth: bool,
+    /// 自动重连: 两次尝试之间的间隔(秒)
+    #[serde(default = "default_reauth_interval")]
+    pub reauth_interval_secs: u32,
+    /// 自动重连: 每次掉线最多尝试认证的次数(含立即重试的第 1 次)
+    #[serde(default = "default_reauth_retries")]
+    pub reauth_max_retries: u32,
+    /// 统计: 检测到掉线的次数(在线 -> 未认证 的跳变)
+    #[serde(default)]
+    pub drop_count: u64,
+    /// 统计: 自动重连成功次数
+    #[serde(default)]
+    pub reauth_count: u64,
     /// 滚动日志(与配置同文件,最多 MAX_LOG_LINES 行)
     #[serde(default)]
     pub log_lines: Vec<String>,
@@ -46,6 +63,15 @@ pub struct StoreData {
 
 fn default_ua() -> String {
     "pc".into()
+}
+
+/// 自动重连默认参数(间隔 30 秒 / 最多 3 次)
+fn default_reauth_interval() -> u32 {
+    30
+}
+
+fn default_reauth_retries() -> u32 {
+    3
 }
 
 impl Default for StoreData {
@@ -59,6 +85,12 @@ impl Default for StoreData {
             portal_url: String::new(),
             wlanacip: String::new(),
             wlanacname: String::new(),
+            auto_start: false,
+            auto_reauth: false,
+            reauth_interval_secs: default_reauth_interval(),
+            reauth_max_retries: default_reauth_retries(),
+            drop_count: 0,
+            reauth_count: 0,
             log_lines: Vec::new(),
         }
     }
@@ -67,7 +99,6 @@ impl Default for StoreData {
 pub struct Store {
     path: PathBuf,
     pub data: StoreData,
-    dirty: AtomicBool,
 }
 
 impl Store {
@@ -88,7 +119,6 @@ impl Store {
         Store {
             path,
             data,
-            dirty: AtomicBool::new(false),
         }
     }
 
@@ -100,7 +130,6 @@ impl Store {
                 let _ = std::fs::rename(&tmp, &self.path);
             }
         }
-        self.dirty.store(false, Ordering::Relaxed);
     }
 
     /// 追加一条日志(带时间戳, 滚动裁剪 + 7 天过期清理, 立即落盘)
@@ -112,8 +141,7 @@ impl Store {
             self.data.log_lines.drain(..excess);
         }
         self.drop_expired_logs();
-        self.dirty.store(true, Ordering::Relaxed);
-        self.save_if_dirty();
+        self.save();
     }
 
     /// 删除超过 LOG_KEEP_DAYS 天的日志行(默认 7 天)
@@ -122,20 +150,20 @@ impl Store {
         // 行格式固定 "[YYYY-MM-DD HH:MM:SS] ...", 同格式 ISO 字典序即时间序
         self.data
             .log_lines
-            .retain(|ln| ln.len() < 20 || ln[1..20].as_bytes() >= deadline.as_bytes());
+            .retain(|ln| ln.len() < 20 || &ln.as_bytes()[1..20] >= deadline.as_bytes());
     }
 
     /// 清空全部日志(历史日志窗口「清除日志」按钮)
-    #[allow(dead_code)] // 仅 GUI bin 使用
     pub fn clear_logs(&mut self) {
         self.data.log_lines.clear();
         self.save();
     }
 
-    fn save_if_dirty(&self) {
-        if self.dirty.load(Ordering::Relaxed) {
-            self.save();
-        }
+    /// 是否有可直接用于自动认证的已存凭据
+    pub fn has_usable_credentials(&self) -> bool {
+        self.data.save_password
+            && !self.data.username.is_empty()
+            && self.get_password().is_some()
     }
 
     /// 保存账号(勾选时密码 DPAPI 加密写入; 未勾选时账号密码一并清除)
@@ -180,5 +208,46 @@ impl Store {
             return None;
         }
         crate::crypto::unprotect(&self.data.password_dpapi).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧版本(升级前)的 dat 文件没有自启/重连字段,
+    /// 反序列化时必须走 serde default, 不能让老用户的数据文件读不出来
+    #[test]
+    fn old_dat_without_new_fields_still_loads() {
+        let old_json = r#"{
+            "username": "20260001",
+            "password_dpapi": "",
+            "save_password": false,
+            "ua": "pc",
+            "adapter": "WLAN",
+            "portal_url": "http://10.255.2.249",
+            "wlanacip": "10.255.2.250",
+            "wlanacname": "hzxy",
+            "log_lines": ["[2026-10-20 10:00:00] hello"]
+        }"#;
+        let data: StoreData = serde_json::from_str(old_json).unwrap();
+        assert_eq!(data.username, "20260001");
+        // 新字段全部落到默认值
+        assert!(!data.auto_start);
+        assert!(!data.auto_reauth);
+        assert_eq!(data.reauth_interval_secs, 30);
+        assert_eq!(data.reauth_max_retries, 3);
+        assert_eq!(data.drop_count, 0);
+        assert_eq!(data.reauth_count, 0);
+        assert_eq!(data.log_lines.len(), 1);
+    }
+
+    #[test]
+    fn defaults_match_documented_values() {
+        let d = StoreData::default();
+        assert_eq!(d.reauth_interval_secs, 30);
+        assert_eq!(d.reauth_max_retries, 3);
+        assert!(!d.auto_start);
+        assert!(!d.auto_reauth);
     }
 }

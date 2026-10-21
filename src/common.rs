@@ -1,11 +1,7 @@
-// -*- coding: utf-8 -*-
 //! 公共常量与工具函数
 
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-
-/// 项目主页(GitHub 仓库)
-pub const REPO_URL: &str = "https://github.com/d2su8/HZXYNET-AutoLogin";
 
 /// 免责声明(界面/命令行都会展示)
 pub const DISCLAIMER: &str = "免责声明: 本软件供学习交流使用, 请遵守所在学校/机构的网络使用规定。";
@@ -65,16 +61,9 @@ pub fn now_str() -> String {
     }
 }
 
-/// 计算 days 天前的本地时间字符串 "YYYY-MM-DD 00:00:00"
-/// (用于日志过期判定: 同格式 ISO 字典序即时间序)
-pub fn cutoff_str(days: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-        - days as i64 * 86_400;
-    // Howard Hinnant civil_from_days 算法: epoch 天数 -> (年, 月, 日)
-    let z = now.div_euclid(86_400) + 719_468;
+/// Howard Hinnant civil_from_days: 自 epoch 的天数 -> (年, 月, 日)
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -84,6 +73,30 @@ pub fn cutoff_str(days: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Howard Hinnant days_from_civil: (年, 月, 日) -> 自 epoch 的天数
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// 计算 days 天前的**本地**日期字符串 "YYYY-MM-DD 00:00:00"
+/// (用于日志过期判定: 与 now_str 同用本地时间, 同格式 ISO 字典序即时间序)
+pub fn cutoff_str(days: u64) -> String {
+    let (y, m, d) = unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        civil_from_days(
+            days_from_civil(st.wYear as i64, st.wMonth as i64, st.wDay as i64) - days as i64,
+        )
+    };
     format!("{:04}-{:02}-{:02} 00:00:00", y, m, d)
 }
 
@@ -315,4 +328,31 @@ pub fn extract_err_message(html: &str) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_days_roundtrip() {
+        // 1970-01-01 对应 epoch 天数 0
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2000-03-01 为闰年边界(2 月 29 日在 2000 年存在)
+        assert_eq!(days_from_civil(2000, 3, 1), days_from_civil(2000, 2, 29) + 1);
+        for z in [0i64, 1, 365, 366, 10_957, 18_628, 40_000] {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z, "roundtrip z={z}");
+        }
+    }
+
+    #[test]
+    fn cutoff_is_local_date_format() {
+        let s = cutoff_str(7);
+        assert_eq!(s.len(), "YYYY-MM-DD 00:00:00".len());
+        assert!(s.ends_with(" 00:00:00"));
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+    }
 }
