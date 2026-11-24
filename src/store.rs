@@ -32,6 +32,9 @@ pub struct StoreData {
     /// 自动发现成功时也会把门户基地址写回这里, 下次可直接用。
     #[serde(default)]
     pub portal_url: String,
+    /// 只记录操作者确认过的门户来源，旧文件初始为空。
+    #[serde(default)]
+    pub trusted_portal_origin: String,
     /// 新版门户认证接口要求的网关参数(从劫持 URL 学到, 设备在线时也用它);
     /// 值形如 wlanacip=10.255.2.250 / wlanacname=hzxy
     #[serde(default)]
@@ -83,6 +86,7 @@ impl Default for StoreData {
             ua: default_ua(),
             adapter: String::new(),
             portal_url: String::new(),
+            trusted_portal_origin: String::new(),
             wlanacip: String::new(),
             wlanacname: String::new(),
             auto_start: false,
@@ -112,24 +116,33 @@ impl Store {
     }
 
     pub fn load(path: PathBuf) -> Store {
-        let data = std::fs::read(&path)
+        let mut data: StoreData = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<StoreData>(&b).ok())
             .unwrap_or_default();
-        Store {
-            path,
-            data,
+        // Earlier versions logged dynamic form values and account identifiers.
+        let before = data.log_lines.len();
+        data.log_lines.retain(|line| {
+            !["表单明细:", "账号=", "userId=", "门户返回:", "门户返回消息:", "最后的门户消息:"]
+                .iter().any(|marker| line.contains(marker))
+        });
+        let store = Store { path, data };
+        if store.data.log_lines.len() != before {
+            store.save();
         }
+        store
     }
 
     /// 原子落盘: 先写临时文件再替换, 避免写一半时崩溃损坏数据文件(内含加密凭据)
     pub fn save(&self) {
-        if let Ok(json) = serde_json::to_vec_pretty(&self.data) {
-            let tmp = self.path.with_extension("dat.tmp");
-            if std::fs::write(&tmp, &json).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.path);
-            }
-        }
+        let _ = self.try_save();
+    }
+
+    pub fn try_save(&self) -> Result<(), String> {
+        let json = serde_json::to_vec_pretty(&self.data).map_err(|e| e.to_string())?;
+        let tmp = self.path.with_extension("dat.tmp");
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
     }
 
     /// 追加一条日志(带时间戳, 滚动裁剪 + 7 天过期清理, 立即落盘)
@@ -176,22 +189,20 @@ impl Store {
         adapter: &str,
     ) -> Result<(), String> {
         if save_password {
+            let encrypted = match password {
+                Some(pw) if !pw.is_empty() => crate::crypto::protect(pw)?,
+                _ => String::new(),
+            };
             self.data.username = username.to_string();
             self.data.save_password = true;
             self.data.ua = ua.to_string();
             self.data.adapter = adapter.to_string();
-            match password {
-                Some(pw) if !pw.is_empty() => {
-                    self.data.password_dpapi = crate::crypto::protect(pw)?;
-                }
-                _ => self.data.password_dpapi.clear(),
-            }
+            self.data.password_dpapi = encrypted;
         } else {
             // 未勾选保存: 账号密码一起清除
             self.clear_credentials();
         }
-        self.save();
-        Ok(())
+        self.try_save()
     }
 
     /// 清除已保存的账号密码(全部)
@@ -199,7 +210,6 @@ impl Store {
         self.data.username.clear();
         self.data.password_dpapi.clear();
         self.data.save_password = false;
-        self.save();
     }
 
     /// 读取解密后的密码(未保存返回空)

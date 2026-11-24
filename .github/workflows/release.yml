@@ -1,0 +1,97 @@
+name: Build and release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Test and build Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Validate versions and resolve the executable name
+        id: version
+        shell: pwsh
+        run: |
+          $json = cargo +stable metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $package = ($json | ConvertFrom-Json).packages | Where-Object { $_.name -eq 'campus-auth' }
+          $binary = 'campus-auth-' + $package.version.Replace('.', '_')
+          if (-not ($package.targets | Where-Object { $_.kind -contains 'bin' -and $_.name -eq $binary })) {
+            throw "Cargo.toml must declare the versioned binary $binary"
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$($package.version)") {
+            throw "Release tag must be v$($package.version)"
+          }
+          "binary=$binary" >> $env:GITHUB_OUTPUT
+
+      - name: Run tests
+        run: cargo +stable test --locked
+
+      - name: Build the release executable
+        env:
+          BIN: ${{ steps.version.outputs.binary }}
+        shell: pwsh
+        run: |
+          cargo +stable build --locked --release --bin $env:BIN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-Item -LiteralPath "target/release/$env:BIN.exe"
+          if ($exe.Length -le 0) { throw "Executable is empty" }
+
+      - name: Upload the Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: campus-auth-windows-x64
+          path: target/release/${{ steps.version.outputs.binary }}.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish the official release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download the Windows executable
+        uses: actions/download-artifact@v8
+        with:
+          name: campus-auth-windows-x64
+          path: dist
+
+      - name: Verify the executable matches the tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test -s "dist/campus-auth-${version//./_}.exe"
+
+      - name: Publish the executable
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/campus-auth-*.exe
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: false

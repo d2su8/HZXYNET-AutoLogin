@@ -25,6 +25,7 @@ pub enum ProbeState {
     Unreachable(String),
     /// 无结论(如 baidu http->https 的正常 302)
     Inconclusive,
+    Mixed,
 }
 
 /// 认证结果代码
@@ -35,7 +36,16 @@ pub const CODE_CONFLICT: &str = "conflict";
 pub const CODE_UNREACHABLE: &str = "unreachable";
 /// 探测不到门户且未配置门户地址(需用户手动填写)
 pub const CODE_NO_PORTAL: &str = "no-portal";
+pub const CODE_UNTRUSTED_PORTAL: &str = "untrusted-portal";
 pub const CODE_FAIL: &str = "fail";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthStage {
+    Probe,
+    Portal,
+    Submit,
+    Verify,
+}
 
 pub struct Auth<'a> {
     /// 完整 User-Agent 串
@@ -47,6 +57,9 @@ pub struct Auth<'a> {
     /// 手动指定的门户地址(留空/None = 只用劫持自动发现);
     /// 可填基地址(http://10.10.0.1)或从浏览器抄来的完整登录页地址
     pub portal_url: Option<String>,
+    trusted_origin: Option<String>,
+    cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
+    progress: Option<&'a (dyn Fn(AuthStage) + Sync)>,
     /// 本次认证实际用到的门户基地址(供上层写回配置)
     pub discovered_base: std::sync::Mutex<Option<String>>,
     /// 新版门户登录后返回的自助后台令牌(Bearer), 供下线流程复用;
@@ -56,6 +69,94 @@ pub struct Auth<'a> {
     pub discovered_ac: std::sync::Mutex<Option<(String, String)>>,
     /// 配置里保存的网关参数兜底(设备在线、拿不到劫持 URL 时用)
     pub ac_hint: Option<(String, String)>,
+}
+
+/// Compare the scheme, host, and effective port. Reject ambiguous authorities.
+pub fn portal_origin(url: &str) -> Option<String> {
+    if url.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\') {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok().filter(|p| *p != 0)?),
+        None => (authority, default_port),
+    };
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)) {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    Some(if port == default_port {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    })
+}
+
+fn join_portal_location(url: &str, location: &str) -> Option<String> {
+    let origin = portal_origin(url)?;
+    let location = location.trim();
+    if location.is_empty() || location.starts_with('#') {
+        return None;
+    }
+    let joined = if location.starts_with("//") {
+        format!("{}:{location}", origin.split(':').next()?)
+    } else if location.starts_with('/') {
+        format!("{origin}{location}")
+    } else if location.split('/').next()?.contains(':') {
+        location.to_string()
+    } else {
+        let authority = url.split_once("://")?.1;
+        let path_index = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+        let path = authority[path_index..].split(['?', '#']).next()?;
+        if location.starts_with('?') {
+            format!("{origin}{path}{location}")
+        } else {
+            let directory = path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+            format!("{origin}{directory}/{location}")
+        }
+    };
+    portal_origin(&joined).map(|_| joined)
+}
+
+fn probe_response_is_online(host: &str, path: &str, status: u16, body: &[u8]) -> bool {
+    match (host, path) {
+        ("www.msftconnecttest.com", "/connecttest.txt") =>
+            status == 200 && String::from_utf8_lossy(body).trim() == "Microsoft Connect Test",
+        ("connect.rom.miui.com", "/generate_204") => status == 204 && body.is_empty(),
+        _ => status == 200 || status == 204,
+    }
+}
+
+fn summarize_probes(states: impl IntoIterator<Item = ProbeState>) -> ProbeState {
+    let mut online = false;
+    let mut captive: Option<String> = None;
+    let mut error = None;
+    for state in states {
+        match state {
+            ProbeState::Online => online = true,
+            ProbeState::Captive(url) => {
+                if captive.as_ref().is_some_and(|first| portal_origin(first) != portal_origin(&url)) {
+                    return ProbeState::Mixed;
+                }
+                captive.get_or_insert(url);
+            }
+            ProbeState::Unreachable(msg) => { error.get_or_insert(msg); }
+            _ => {}
+        }
+    }
+    match (online, captive, error) {
+        (true, Some(_), _) => ProbeState::Mixed,
+        (true, None, _) => ProbeState::Online,
+        (false, Some(url), _) => ProbeState::Captive(url),
+        (false, None, Some(msg)) => ProbeState::Unreachable(msg),
+        _ => ProbeState::Inconclusive,
+    }
 }
 
 /// 取 URL 里的主机名(不含 scheme/端口/路径)
@@ -99,27 +200,14 @@ pub fn url_base(url: &str) -> String {
 /// 返回 Some(绝对地址) = 被劫持; None = 正常跳转
 pub fn captive_target(requested_host: &str, loc: &str) -> Option<String> {
     let loc = loc.trim();
-    if loc.is_empty() {
+    let url = join_portal_location(&format!("http://{requested_host}/"), loc)?;
+    if loc.starts_with('/') && !loc.starts_with("//") {
+        return Some(url);
+    }
+    if url_host(&url).eq_ignore_ascii_case(url_host(requested_host)) {
         return None;
     }
-    if loc.starts_with('/') {
-        // 相对路径: 按请求主机补全(AC 会再次劫持/或直接给出门户页)
-        return Some(format!("http://{requested_host}{loc}"));
-    }
-    if let Some(rest) = loc.strip_prefix("https://") {
-        // 门户极少用 https; 若真给了, 说明是被指向了某个站点, 交给上层去请求(会走 https 分支失败)
-        let host = rest.split(['/', ':']).next().unwrap_or("");
-        return if host.eq_ignore_ascii_case(requested_host) {
-            None
-        } else {
-            Some(loc.to_string())
-        };
-    }
-    let host = url_host(loc);
-    if host.is_empty() || host.eq_ignore_ascii_case(requested_host) {
-        return None;
-    }
-    Some(loc.to_string())
+    Some(url)
 }
 
 /// 本次要探测的地址表: 默认用内置 3 个;
@@ -248,6 +336,9 @@ impl<'a> Auth<'a> {
             client: HttpClient::new(source),
             log,
             portal_url: None,
+            trusted_origin: None,
+            progress: None,
+            cancelled: None,
             discovered_base: std::sync::Mutex::new(None),
             token: std::sync::Mutex::new(None),
             discovered_ac: std::sync::Mutex::new(None),
@@ -257,7 +348,28 @@ impl<'a> Auth<'a> {
 
     /// 设置手动门户地址(空串/None = 只用劫持自动发现)
     pub fn set_portal_url(&mut self, url: Option<String>) {
-        self.portal_url = url.filter(|s| !s.trim().is_empty());
+        self.portal_url = url.filter(|s| !s.trim().is_empty()).map(|url| {
+            if url.contains("://") { url } else { format!("http://{url}") }
+        });
+        self.trusted_origin = self.portal_url.as_deref().and_then(portal_origin);
+    }
+
+    pub fn set_progress(&mut self, progress: &'a (dyn Fn(AuthStage) + Sync)) {
+        self.progress = Some(progress);
+    }
+
+    pub fn set_cancelled(&mut self, cancelled: &'a (dyn Fn() -> bool + Sync)) {
+        self.cancelled = Some(cancelled);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.is_some_and(|cancelled| cancelled())
+    }
+
+    fn mark(&self, stage: AuthStage) {
+        if let Some(report) = self.progress {
+            report(stage);
+        }
     }
 
     /// 设置网关参数兜底(配置里存下来的 wlanacip/wlanacname)
@@ -282,14 +394,14 @@ impl<'a> Auth<'a> {
         match self.client.request("GET", &format!("http://{host}{path}"), &[("Accept", "*/*")], None)
         {
             Ok(resp) => {
-                if let Some(loc) = resp.header("Location") {
+                if let Some(loc) = resp.header("Location").filter(|_| (300..400).contains(&resp.status)) {
                     // 跨主机/相对路径 => 被劫持; 同主机跳转(如 baidu->https) => 无结论
                     return match captive_target(host, loc) {
-                        Some(url) => ProbeState::Captive(url),
-                        None => ProbeState::Inconclusive,
+                        Some(url) if portal_origin(&url).is_some() => ProbeState::Captive(url),
+                        _ => ProbeState::Inconclusive,
                     };
                 }
-                if resp.status == 200 || resp.status == 204 {
+                if resp.header("Location").is_none() && probe_response_is_online(host, path, resp.status, &resp.body) {
                     return ProbeState::Online;
                 }
                 ProbeState::Inconclusive
@@ -300,9 +412,13 @@ impl<'a> Auth<'a> {
 
     /// 跟随跳转抓取登录页, 返回 (最终 URL, HTML, Cookie)。最多 3 跳。
     /// 相对 Location 按当前 URL 补全, 因此不再依赖任何写死的门户地址。
-    fn fetch_login_page(&self, start_url: &str) -> Result<(String, String, String), String> {
+    fn fetch_login_page(&self, start_url: &str, trusted_origin: Option<&str>) -> Result<(String, String, String), String> {
         let mut url = start_url.to_string();
         for hop in 0..3 {
+            let origin = portal_origin(&url).ok_or("门户地址无效")?;
+            if trusted_origin.is_some_and(|trusted| trusted != origin) {
+                return Err(format!("门户跳转到了未确认的地址 {origin}"));
+            }
             let resp = self.client.request(
                 "GET",
                 &url,
@@ -313,21 +429,8 @@ impl<'a> Auth<'a> {
                 ],
                 None,
             )?;
-            if let Some(loc) = resp.header("Location") {
-                let next = if loc.trim().starts_with('/') {
-                    format!("{}{}", url_base(&url), loc.trim())
-                } else if loc.trim().starts_with("http://") || loc.trim().starts_with("https://") {
-                    loc.trim().to_string()
-                } else {
-                    // 形如 "portal/login?...": 相对当前目录
-                    let base = url.trim_end_matches('/');
-                    format!("{base}/{}", loc.trim())
-                };
-                (self.log)(&format!(
-                    "  跳转 {} -> {}",
-                    url,
-                    next
-                ));
+            if let Some(loc) = resp.header("Location").filter(|_| (300..400).contains(&resp.status)) {
+                let next = join_portal_location(&url, loc).ok_or("门户跳转地址无效")?;
                 url = next;
                 if hop == 2 {
                     return Err("跳转次数过多, 未拿到登录页".into());
@@ -349,47 +452,25 @@ impl<'a> Auth<'a> {
         Err("未拿到登录页".into())
     }
 
-    /// 并发探测三个地址, 任一给出结论即返回
-    /// 返回 (Some(true)=在线 / Some(false)=被劫持 / None=无结论, 详情)
-    pub fn connectivity_test(&self) -> (Option<bool>, String) {
-        let targets = probe_targets();
-        (self.log)(&format!("联通测试开始(并发 {} 个探测地址)...", targets.len()));
-        let (tx, rx) = std::sync::mpsc::channel();
-        thread::scope(|s| {
-            for (host, path) in &targets {
-                let tx = tx.clone();
-                let (h, p) = (host.clone(), path.clone());
-                s.spawn(move || {
-                    let state = self.probe_one(&h, &p);
-                    let _ = tx.send((h, p, state));
-                });
-            }
-            drop(tx);
-            let mut unreachable_msg = String::new();
-            for (host, path, state) in rx.iter() {
-                match state {
-                    ProbeState::Online => {
-                        (self.log)(&format!("探测 {host}{path} -> 200/204 无重定向, 已联网(已认证)"));
-                        return (Some(true), format!("{host}{path}"));
-                    }
-                    ProbeState::Captive(loc) => {
-                        (self.log)(&format!("探测 {host}{path} -> 302 被劫持, 未认证"));
-                        return (Some(false), loc);
-                    }
-                    ProbeState::Unreachable(e) => {
-                        (self.log)(&format!("探测 {host}{path} -> 网络异常: {e}"));
-                        unreachable_msg = e;
-                    }
-                    ProbeState::Inconclusive => {}
-                }
-            }
-            if !unreachable_msg.is_empty() {
-                (self.log)("三个探测地址均网络异常: 网卡可能未连接");
-            } else {
-                (self.log)("三个探测地址均无结论");
-            }
-            (None, unreachable_msg)
+    fn run_probes(&self) -> ProbeState {
+        thread::scope(|scope| {
+            let tasks: Vec<_> = probe_targets().into_iter()
+                .map(|(host, path)| scope.spawn(move || self.probe_one(&host, &path)))
+                .collect();
+            summarize_probes(tasks.into_iter().map(|task| task.join().unwrap_or(ProbeState::Inconclusive)))
         })
+    }
+
+    pub fn connectivity_test(&self) -> (Option<bool>, String) {
+        let (verdict, detail) = match self.run_probes() {
+            ProbeState::Online => (Some(true), "探测通过".into()),
+            ProbeState::Captive(url) => (Some(false), url_base(&url)),
+            ProbeState::Mixed => (None, "探测结果冲突，暂缓认证".into()),
+            ProbeState::Unreachable(e) => (None, e),
+            ProbeState::Inconclusive => (None, "所有探测地址均无结论".into()),
+        };
+        (self.log)(&detail);
+        (verdict, detail)
     }
 
     /// 只做"找认证服务器": 探测劫持(或验证已配置的门户地址), 返回门户基地址。
@@ -399,7 +480,7 @@ impl<'a> Auth<'a> {
             if let ProbeState::Captive(url) = self.probe_one(&host, &path) {
                 (self.log)(&format!("探测 {host}{path} -> 302 被劫持: {url}"));
                 let base = url_base(&url);
-                match self.fetch_login_page(&url) {
+                match self.fetch_login_page(&url, None) {
                     Ok((final_url, html, _)) => {
                         (self.log)(&format!(
                             "  登录页{} (最终地址 {final_url})",
@@ -414,7 +495,7 @@ impl<'a> Auth<'a> {
         // 没有劫持响应: 验证配置里的地址
         if let Some(p) = self.portal_url.as_deref() {
             (self.log)(&format!("无劫持响应, 验证配置的门户地址: {p}"));
-            if let Ok((final_url, html, _)) = self.fetch_login_page(p) {
+            if let Ok((final_url, html, _)) = self.fetch_login_page(p, None) {
                 (self.log)(&format!(
                     "  可达, {} (最终地址 {final_url})",
                     if looks_like_portal_page(&html) { "像门户登录页" } else { "内容不像门户登录页" }
@@ -435,26 +516,16 @@ impl<'a> Auth<'a> {
                 }
             }
         }
-        // 门户地址: 先看劫持, 再看配置
-        let mut loc: Option<String> = None;
-        for (h, p) in probe_targets() {
-            if let ProbeState::Captive(u) = self.probe_one(&h, &p) {
-                loc = Some(u);
-                break;
-            }
-        }
-        let loc = match loc.or_else(|| self.portal_url.clone()) {
-            Some(l) => l,
-            None => {
-                return Err(
-                    "定位不到门户: 没有劫持响应, 也没配置门户地址(界面「门户地址」或 --portal)".into(),
-                )
-            }
+        let origin = self.trusted_origin.as_deref().ok_or("请先确认门户地址")?;
+        let loc = match self.run_probes() {
+            ProbeState::Captive(url) => url,
+            ProbeState::Mixed => return Err("探测结果冲突，已暂停下线".into()),
+            _ => self.portal_url.clone().ok_or("请先确认门户地址")?,
         };
+        let (final_url, html, _cookie) = self.fetch_login_page(&loc, Some(origin))?;
         if let Ok(mut g) = self.discovered_base.lock() {
-            *g = Some(url_base(&loc));
+            *g = Some(origin.to_string());
         }
-        let (_final_url, html, _cookie) = self.fetch_login_page(&loc)?;
         let fields = parse_form_fields(&html);
         let (uf, pf) = detect_credential_fields(&parse_form_inputs(&html));
         if pf.is_some() {
@@ -462,7 +533,7 @@ impl<'a> Auth<'a> {
         }
         let _ = uf;
         let mut errmsg = String::new();
-        if let Err((code, msg)) = self.login_spa(&loc, &fields, username, password, &mut errmsg) {
+        if let Err((code, msg)) = self.login_spa(&final_url, &fields, username, password, &mut errmsg) {
             return Err(format!("{msg}({code})"));
         }
         self.token
@@ -530,9 +601,7 @@ impl<'a> Auth<'a> {
             .collect::<Vec<_>>()
             .join("&");
         (self.log)("  检测到新版门户(SPA, 登录页无表单), 走接口 /portal/webauth/auth");
-        (self.log)(&format!(
-            "  提交: userId={username} passwd=*** loginMode=password wlanuserip={ip} wlanacip={acip} wlanacname={acname}"
-        ));
+        (self.log)("提交新版门户认证请求");
         let headers = [
             ("User-Agent", self.ua.as_str()),
             ("Accept", "application/json, text/plain, */*"),
@@ -540,6 +609,10 @@ impl<'a> Auth<'a> {
             ("Referer", loc),
             ("Origin", base.as_str()),
         ];
+        if self.is_cancelled() {
+            return Err(("cancelled", "认证已取消".into()));
+        }
+        self.mark(AuthStage::Submit);
         let resp = self
             .client
             .request("POST", &auth_url, &headers, Some(&body))
@@ -559,7 +632,7 @@ impl<'a> Auth<'a> {
         let success = v["success"].as_bool().unwrap_or(false);
         let message = v["message"].as_str().unwrap_or("").to_string();
         if !success {
-            (self.log)(&format!("  门户返回: {message}"));
+            (self.log)(&crate::common::redact_credentials(&format!("门户返回: {message}"), username, password));
             if message.contains("密码") || BADPASS_KEYWORDS.iter().any(|k| message.contains(k)) {
                 return Err((CODE_BADPASS, message));
             }
@@ -580,7 +653,7 @@ impl<'a> Auth<'a> {
             }
         }
         if let Some(e) = result["redirect"].as_str().and_then(|r| query_param(r, "errorMsg")) {
-            (self.log)(&format!("  门户返回消息: {e}"));
+            (self.log)(&crate::common::redact_credentials(&format!("门户返回消息: {e}"), username, password));
             *errmsg_out = e.clone();
             if e.contains("已在线") {
                 (self.log)("本机已在线, 无需重复认证");
@@ -594,69 +667,34 @@ impl<'a> Auth<'a> {
 
     /// 完整登录流程. 返回 (成功?, code, detail)
     pub fn login(&self, username: &str, password: &str) -> (bool, &'static str, String) {
-        (self.log)(&format!(
-            "=== 开始认证: 账号={username} 设备={} 源地址={} ===",
-            self.device_label(),
-            self.client
-                .source
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| "系统默认路由".into())
-        ));
-        (self.log)(&format!("本次 UA: {}", self.ua));
-
-        // ---- 第 1 步: 探测, 拿劫持 Location ------------------------------
-        let mut loc: Option<String> = None;
-        for (host, path) in probe_targets() {
-            match self.probe_one(&host, &path) {
-                ProbeState::Online => {
-                    (self.log)(&format!("探测 {host}{path} -> 已放行, 本机已在线"));
-                    return (true, CODE_ALREADY, "已在线".into());
-                }
-                ProbeState::Captive(l) => {
-                    loc = Some(l);
-                    break;
-                }
-                _ => continue,
-            }
+        if self.is_cancelled() {
+            return (false, "cancelled", "认证已取消".into());
         }
-        // 探测不到劫持: 用配置里的门户地址; 也没有则提示手动获取
-        let loc = match loc {
-            Some(l) => {
-                (self.log)("第 1 步完成: 未认证, 已取得会话绑定参数");
-                (self.log)(&format!("  Location = {l}"));
-                if let Ok(mut g) = self.discovered_base.lock() {
-                    *g = Some(url_base(&l));
-                }
-                l
-            }
-            None => match self.portal_url.as_deref() {
-                Some(p) => {
-                    (self.log)(&format!(
-                        "探测不到劫持响应, 改用配置的门户地址: {p}"
-                    ));
-                    p.to_string()
-                }
-                None => {
-                    (self.log)("!! 探测不到门户劫持响应, 且未配置门户地址");
-                    (self.log)("   手动获取办法: 浏览器打开任意 http 网站(如 http://www.msftconnecttest.com/connecttest.txt),");
-                    (self.log)("   地址栏会跳到校园网认证页 — 把那个地址整条复制到「门户地址」框里再试。");
-                    return (
-                        false,
-                        CODE_NO_PORTAL,
-                        "未探测到门户, 请手动填写门户地址(浏览器打开任意 http 网站, 复制跳转后的地址)".into(),
-                    );
-                }
-            },
+        self.mark(AuthStage::Probe);
+        let loc = match self.run_probes() {
+            ProbeState::Online => return (true, CODE_ALREADY, "已在线".into()),
+            ProbeState::Mixed => return (false, CODE_FAIL, "探测结果冲突，暂缓认证".into()),
+            ProbeState::Captive(url) => Some(url),
+            _ => self.portal_url.clone(),
         };
-
-        // ---- 第 2 步: GET 登录页(跟随跳转), 种 Cookie + 动态解析字段 ------
-        let (loc, page_text, cookie) = match self.fetch_login_page(&loc) {
-            Ok(v) => v,
-            Err(e) => {
-                (self.log)(&format!("!! 获取登录页失败: {e}"));
-                return (false, CODE_UNREACHABLE, format!("门户连接失败: {e}"));
-            }
+        let Some(loc) = loc else {
+            return (false, CODE_NO_PORTAL, "未发现认证门户".into());
         };
+        if self.is_cancelled() {
+            return (false, "cancelled", "认证已取消".into());
+        }
+        self.mark(AuthStage::Portal);
+        let candidate = portal_origin(&loc).unwrap_or_default();
+        let Some(origin) = self.trusted_origin.as_deref().filter(|trusted| *trusted == candidate) else {
+            return (false, CODE_UNTRUSTED_PORTAL, format!("请确认门户地址 {candidate}"));
+        };
+        let (loc, page_text, cookie) = match self.fetch_login_page(&loc, Some(origin)) {
+            Ok(page) => page,
+            Err(e) => return (false, CODE_UNREACHABLE, format!("门户连接失败: {e}")),
+        };
+        if let Ok(mut g) = self.discovered_base.lock() {
+            *g = Some(origin.to_string());
+        }
         if cookie.is_empty() {
             (self.log)("第 2 步完成: 门户未下发 Cookie, 继续尝试");
         } else {
@@ -685,7 +723,7 @@ impl<'a> Auth<'a> {
 
         let page_err = extract_err_message(&page_text);
         if !page_err.is_empty() {
-            (self.log)(&format!("  注意: 登录页自带提示信息: {page_err}"));
+            (self.log)(&crate::common::redact_credentials(&format!("注意: 登录页自带提示信息: {page_err}"), username, password));
         }
 
         // 门户按本次请求 UA 下发的模板类型(设备类型判定的直接证据)
@@ -765,19 +803,7 @@ impl<'a> Auth<'a> {
             .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
             .collect::<Vec<_>>()
             .join("&");
-        // 调试可见性: 打印表单键名清单与关键身份字段(密码不出现在日志)
-        let keys_dbg = form_pairs
-            .iter()
-            .map(|(k, v)| {
-                if k.eq_ignore_ascii_case("passwd") {
-                    format!("{}=***", k)
-                } else {
-                    format!("{}={}", k, v)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        (self.log)(&format!("  表单明细: {}", keys_dbg));
+        (self.log)(&format!("旧版表单已解析（{} 个字段）", form_pairs.len()));
 
         let headers = [
             ("User-Agent", self.ua.as_str()),
@@ -787,6 +813,10 @@ impl<'a> Auth<'a> {
             ("Referer", loc.as_str()),
             ("Cookie", cookie.as_str()),
         ];
+        if self.is_cancelled() {
+            return (false, "cancelled", "认证已取消".into());
+        }
+        self.mark(AuthStage::Submit);
         let resp: HttpResponse = match self.client.request("POST", &loc, &headers, Some(&body)) {
             Ok(r) => r,
             Err(e) => {
@@ -803,7 +833,7 @@ impl<'a> Auth<'a> {
         let resp_text = decode_body(&resp.body);
         errmsg = extract_err_message(&resp_text);
         if !errmsg.is_empty() {
-            (self.log)(&format!("  门户返回消息: {errmsg}"));
+            (self.log)(&crate::common::redact_credentials(&format!("门户返回消息: {errmsg}"), username, password));
             if BADPASS_KEYWORDS.iter().any(|k| errmsg.contains(k)) {
                 return (false, CODE_BADPASS, errmsg);
             }
@@ -819,18 +849,19 @@ impl<'a> Auth<'a> {
 
         } // 结束: 表单式门户分支
 
-        // ---- 第 4 步: 复核放行 --------------------------------------------
+        self.mark(AuthStage::Verify);
         for attempt in 1..=2 {
+            if self.is_cancelled() {
+                return (false, "cancelled", "认证已取消".into());
+            }
             (self.log)(&format!(
                 "第 4 步: 等待 3 秒后复核放行 (第 {attempt}/2 次)..."
             ));
             thread::sleep(Duration::from_secs(3));
-            // 复核用与探测同一批地址(默认即内置第一个), 换过探测地址时行为一致
-            let (rh, rp) = probe_targets()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| (PROBE_URLS[0].0.to_string(), PROBE_URLS[0].1.to_string()));
-            match self.probe_one(&rh, &rp) {
+            if self.is_cancelled() {
+                return (false, "cancelled", "认证已取消".into());
+            }
+            match self.run_probes() {
                 ProbeState::Online => {
                     (self.log)("复核: 200/204 无重定向 -> 已放行");
                     (self.log)("=== 认证成功, 已上线! ===");
@@ -851,7 +882,7 @@ impl<'a> Auth<'a> {
         }
         (self.log)("=== 认证失败: 复核仍未放行 ===");
         if !errmsg.is_empty() {
-            (self.log)(&format!("  最后的门户消息: {errmsg}"));
+            (self.log)(&crate::common::redact_credentials(&format!("最后的门户消息: {errmsg}"), username, password));
         }
         (false, CODE_FAIL, if errmsg.is_empty() { "复核未放行".into() } else { errmsg })
     }
@@ -879,6 +910,24 @@ impl<'a> Auth<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_origin_pins_scheme_host_and_port() {
+        assert_eq!(portal_origin("http://Campus.Example:80/portal").as_deref(), Some("http://campus.example"));
+        assert_ne!(portal_origin("https://campus.example"), portal_origin("http://campus.example"));
+        assert_ne!(portal_origin("http://campus.example:8080"), portal_origin("http://campus.example"));
+        assert!(portal_origin("http://campus.example@other.example").is_none());
+    }
+
+    #[test]
+    fn conflicting_probe_results_are_inconclusive_in_either_order() {
+        let redirected = || ProbeState::Captive("http://campus.example/portal".into());
+        assert!(matches!(summarize_probes([ProbeState::Online, redirected()]), ProbeState::Mixed));
+        assert!(matches!(summarize_probes([redirected(), ProbeState::Online]), ProbeState::Mixed));
+        assert!(!probe_response_is_online("www.msftconnecttest.com", "/connecttest.txt", 200, b"<html>portal</html>"));
+        assert!(probe_response_is_online("www.msftconnecttest.com", "/connecttest.txt", 200, b"Microsoft Connect Test"));
+    }
+
 
     // ---- 劫持识别: 跨主机/相对路径算劫持, 同主机跳转不算 ----
 

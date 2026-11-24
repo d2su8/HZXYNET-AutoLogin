@@ -21,10 +21,9 @@ pub fn self_service_url(portal_base: &str) -> String {
 }
 
 /// 探测地址 (host, path),msft 优先
-pub const PROBE_URLS: [(&str, &str); 3] = [
+pub const PROBE_URLS: [(&str, &str); 2] = [
     ("www.msftconnecttest.com", "/connecttest.txt"),
     ("connect.rom.miui.com", "/generate_204"),
-    ("www.baidu.com", "/"),
 ];
 
 /// 电脑端 User-Agent (占 PC 槽)
@@ -98,6 +97,15 @@ pub fn cutoff_str(days: u64) -> String {
         )
     };
     format!("{:04}-{:02}-{:02} 00:00:00", y, m, d)
+}
+
+/// 移除凭据及其表单编码，避免门户响应把凭据带入诊断。
+pub fn redact_credentials(message: &str, user: &str, pass: &str) -> String {
+    let mut text = message.to_string();
+    for value in [pass, user].into_iter().filter(|value| !value.is_empty()) {
+        text = text.replace(&urlencode(value), "[已隐藏]").replace(value, "[已隐藏]");
+    }
+    text
 }
 
 /// 百分号编码(与 curl --data-urlencode 一致,空格 -> %20)

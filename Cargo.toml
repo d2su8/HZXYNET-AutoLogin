@@ -1,14 +1,14 @@
 [package]
 name = "campus-auth"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 description = "贺州学院校园网认证工具 (Rust / Win32 原生)"
 
-# 产物文件名带版本号(campus-auth-1_4_0.exe), 便于区分不同版本。
+# 产物文件名带版本号(campus-auth-1_5_0.exe), 便于区分不同版本。
 # 注意: cargo 的 bin 名不允许含 '.'(crate 名由 bin 名推导, rustc 拒绝),
 # 所以版本号里的点用下划线; 改 version 时记得同步这里(build.rs 会检查告警)
 [[bin]]
-name = "campus-auth-1_4_0"
+name = "campus-auth-1_5_0"
 path = "src/main.rs"
 
 [dependencies]

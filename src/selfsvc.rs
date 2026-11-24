@@ -160,9 +160,10 @@ pub fn find_own_row(rows: &[DeviceRow], mac_nosep: &str, ip: &str) -> Option<usi
         }
     }
     if !ip.is_empty() {
-        if let Some(i) = rows.iter().position(|r| r.ip == ip) {
-            return Some(i);
-        }
+        let mut candidates = rows.iter().enumerate()
+            .filter(|(_, row)| row.ip == ip && (want_mac.is_empty() || norm_mac(&row.mac).is_empty()));
+        let (index, _) = candidates.next()?;
+        return candidates.next().is_none().then_some(index);
     }
     None
 }
@@ -196,5 +197,6 @@ mod tests {
         assert_eq!(find_own_row(&rows, "bc6ee2344f63", "10.200.0.9"), Some(1)); // MAC 优先
         assert_eq!(find_own_row(&rows, "", "10.200.0.9"), Some(0)); // 退回按 IP
         assert_eq!(find_own_row(&rows, "112233445566", "10.9.9.9"), None);
+        assert_eq!(find_own_row(&rows, "112233445566", "10.200.0.9"), None);
     }
 }
